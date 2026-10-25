@@ -583,3 +583,115 @@ data.table(
 #   `lapply()` / `map_dbl()` call the compiled `mean()` once per column and are as fast as data.table's `.SD`
 #   and even faster than `colMeans()`, because `colMeans()` and `apply(, 2)` must first convert the
 #   data.frame into a matrix (an extra copy). Functional style is the best choice there.
+
+# ---
+# ## 6. Task 4 – Parallel Computing with foreach + doParallel
+#
+# ### 6.1 Logical partitions
+# The dataset is divided into **month-wise partitions** (6 subsets of ≈ 3 million trips). Only the columns needed
+# by the analysis are kept so that less data has to be sent to the worker processes.
+
+parts <- split(trips[, .(month, pu_borough, fare_amount, total_amount, trip_distance, trip_duration_min, tip_amount)],
+               by = "month", keep.by = TRUE, drop = TRUE)
+data.table(month = names(parts), rows = sapply(parts, nrow), size_MB = round(sapply(parts, function(p) object.size(p)) / 2^20, 1))
+
+# ### 6.2 Computationally intensive operation – bootstrap analysis per month
+# For every month we estimate **95 % bootstrap confidence intervals** for the mean total amount, the median trip
+# distance and the mean fare per mile (`B` resamples of ≈ 3 million rows each), plus borough-level statistics.
+# Resampling millions of rows many times is CPU-bound and each month is independent – a good candidate for
+# parallelism.
+
+analyse_partition <- function(d, B = 20) {
+  data.table::setDTthreads(1)              # one thread per worker -> fair sequential vs parallel comparison
+  set.seed(1000 + match(as.character(d$month[1]), month.abb))  # reproducible, identical in both modes
+  n <- nrow(d)
+  boot <- t(vapply(seq_len(B), function(b) {
+    idx <- sample.int(n, n, replace = TRUE)
+    c(mean_total    = mean(d$total_amount[idx]),
+      median_dist   = median(d$trip_distance[idx]),
+      fare_per_mile = mean(d$fare_amount[idx] / d$trip_distance[idx]))
+  }, numeric(3)))
+  ci <- apply(boot, 2, quantile, probs = c(0.025, 0.975))
+  data.table::data.table(
+    month = as.character(d$month[1]), trips = n,
+    mean_total = mean(d$total_amount), mean_total_lo = ci[1, "mean_total"], mean_total_hi = ci[2, "mean_total"],
+    median_dist = median(d$trip_distance), median_dist_lo = ci[1, "median_dist"], median_dist_hi = ci[2, "median_dist"],
+    fare_per_mile = mean(d$fare_amount / d$trip_distance),
+    manhattan_share = mean(d$pu_borough == "Manhattan"))
+}
+B <- 20
+old_threads <- getDTthreads()
+
+# ### 6.3 A. Sequential processing
+
+t_seq <- system.time(res_seq <- rbindlist(lapply(parts, analyse_partition, B = B)))
+t_seq_foreach <- system.time(res_seq_fe <- foreach(d = parts, .combine = rbind) %do% analyse_partition(d, B = B))
+setDTthreads(old_threads)
+cat(sprintf("Sequential lapply()      : %.2f s\nSequential foreach %%do%% : %.2f s\n", t_seq[["elapsed"]], t_seq_foreach[["elapsed"]]))
+res_seq[, lapply(.SD, function(x) if (is.numeric(x)) round(x, 3) else x)]
+
+# ### 6.4 B. Parallel processing with foreach + doParallel
+# A PSOCK cluster (works on Windows, macOS and Linux) is created with `N_CORES` workers; `foreach(... ) %dopar%`
+# sends one monthly partition to each free worker and `rbind`s the results.
+
+t_cluster <- system.time({
+  cl <- makeCluster(N_CORES)
+  registerDoParallel(cl)
+  invisible(clusterEvalQ(cl, library(data.table)))
+})
+cat("Workers registered:", getDoParWorkers(), "| cluster start-up:", t_cluster[["elapsed"]], "s\n")
+
+t_par <- system.time(
+  res_par <- foreach(d = parts, .combine = rbind, .packages = "data.table") %dopar%
+    analyse_partition(d, B = B)
+)
+cat(sprintf("Parallel foreach %%dopar%% with %d workers: %.2f s\n", N_CORES, t_par[["elapsed"]]))
+stopifnot(all.equal(res_seq, res_par, check.attributes = FALSE))   # identical results
+cat("Results identical to sequential run: TRUE\n")
+
+# ### 6.5 Speedup and scaling with the number of cores
+# $$\text{Speedup} = \frac{\text{Sequential execution time}}{\text{Parallel execution time}} \qquad \text{Efficiency} = \frac{\text{Speedup}}{\text{cores}}$$
+
+stopCluster(cl)
+core_grid <- unique(c(1L, 2L, seq(2L, N_CORES, by = 2L), N_CORES))
+scaling <- rbindlist(lapply(core_grid, function(k) {
+  cl_k <- makeCluster(k); registerDoParallel(cl_k)
+  invisible(clusterEvalQ(cl_k, library(data.table)))
+  el <- system.time(foreach(d = parts, .combine = rbind, .packages = "data.table", .export = "B") %dopar%
+                      analyse_partition(d, B = B))[["elapsed"]]
+  stopCluster(cl_k)
+  data.table(cores = k, parallel_s = el)
+}))
+scaling[, `:=`(sequential_s = t_seq[["elapsed"]], speedup = round(t_seq[["elapsed"]] / parallel_s, 2))]
+scaling[, efficiency_pct := round(100 * speedup / cores)]
+scaling
+speedup_main <- round(t_seq[["elapsed"]] / t_par[["elapsed"]], 2)
+cat(sprintf("\nSpeedup with %d cores = %.2f s / %.2f s = %.2fx\n", N_CORES, t_seq[["elapsed"]], t_par[["elapsed"]], speedup_main))
+
+# ### 6.6 When parallelism does not help – a lightweight task
+# Computing a simple mean per month is so cheap that sending ≈ 600 MB of partitions to the workers costs far
+# more than the computation itself.
+
+light_task <- function(d) data.table::data.table(month = as.character(d$month[1]), mean_fare = mean(d$fare_amount))
+cl <- makeCluster(N_CORES); registerDoParallel(cl)
+t_light_seq <- system.time(foreach(d = parts, .combine = rbind) %do% light_task(d))[["elapsed"]]
+t_light_par <- system.time(foreach(d = parts, .combine = rbind, .packages = "data.table") %dopar% light_task(d))[["elapsed"]]
+t_light_dt  <- system.time(trips[, .(mean_fare = mean(fare_amount)), by = month])[["elapsed"]]
+stopCluster(cl); registerDoSEQ()
+light <- data.table(approach = c("Sequential foreach %do%", sprintf("Parallel foreach %%dopar%% (%d cores)", N_CORES), "data.table by = month (no partitions)"),
+                    elapsed_s = c(t_light_seq, t_light_par, t_light_dt))
+light[, speedup_vs_seq := round(t_light_seq / elapsed_s, 2)]
+light
+
+# **Discussion**
+#
+# * For the **CPU-intensive bootstrap**, the parallel version is clearly faster; the speedup grows with the
+#   number of cores but stays **below the ideal linear speedup** (efficiency < 100 %) because of
+#   (1) cluster start-up, (2) serialising each ≈ 100 MB partition to the worker processes,
+#   (3) only 6 partitions for N workers (load imbalance: with 3 workers the last "round" is uneven when 6 is not
+#   a multiple of the core count) and (4) memory-bandwidth contention.
+# * For the **lightweight task** parallel execution is *slower* than sequential: the work per partition takes
+#   milliseconds while copying the data to workers takes seconds. A single data.table grouping on the full table
+#   (which is itself multi-threaded) is faster than both.
+# * Therefore parallel processing pays off only when the computation per partition is large compared with the
+#   communication overhead.
