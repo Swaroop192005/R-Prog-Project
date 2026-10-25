@@ -461,3 +461,125 @@ rbind(daily[order(-trips)][1:3][, type := "busiest"], daily[order(trips)][1:3][,
 #   boroughs. Recorded tips are almost exclusively on card payments.
 # * **Other patterns:** taxis are slowest in the afternoon (congestion) and fastest early in the morning;
 #   most trips carry a single passenger; holidays and storms produce the quietest days.
+
+# ---
+# ## 5. Task 3 – Functional vs Vectorized vs data.table Programming
+#
+# The same analytical operations are implemented in several styles and compared with `microbenchmark`
+# (execution time) and `peak_mem_mb()` (peak extra memory). Row-wise functional code is far too slow for
+# 20 million rows, so a **random sample of 200,000 trips** is used for the row-level experiment and
+# **2 million trips** for the grouping experiment.
+
+samp_dt <- trips[sample(.N, 2e5), .(fare_amount, trip_distance, tip_amount, total_amount, pu_borough, pickup_hour)]
+samp_df <- as.data.frame(samp_dt)          # plain data.frame for the base-R versions
+big_dt  <- trips[sample(.N, 2e6), .(fare_amount, trip_distance, tip_amount, total_amount, pu_borough, pickup_hour)]
+big_df  <- as.data.frame(big_dt)
+cat("Sample sizes:", nrow(samp_df), "and", nrow(big_df), "rows\n")
+bench_results <- list()   # collects every benchmark for Task 5
+add_bench <- function(mb, comparison, n_rows, mem = NULL) {
+  s <- as.data.table(summary(mb, unit = "ms"))[, .(approach = as.character(expr), median_ms = round(median, 3), mean_ms = round(mean, 3))]
+  s[, `:=`(comparison = comparison, rows = n_rows)]
+  if (!is.null(mem)) s[, peak_mem_MB := mem[approach]]
+  bench_results[[comparison]] <<- s
+  s[, relative := round(median_ms / min(median_ms), 1)][order(median_ms)]
+}
+
+# ### 5.1 Experiment A – row-level calculation (fare per mile)
+# Compute `fare_amount / trip_distance` for every trip.
+
+fpm_apply  <- function(df) apply(df[, c("fare_amount", "trip_distance")], 1, function(r) r[1] / r[2])
+fpm_lapply <- function(df) unlist(lapply(seq_len(nrow(df)), function(i) df$fare_amount[i] / df$trip_distance[i]))
+fpm_map    <- function(df) purrr::map2_dbl(df$fare_amount, df$trip_distance, function(f, d) f / d)
+fpm_loop   <- function(df) { out <- numeric(nrow(df)); for (i in seq_len(nrow(df))) out[i] <- df$fare_amount[i] / df$trip_distance[i]; out }
+fpm_vector <- function(df) df$fare_amount / df$trip_distance
+fpm_dt     <- function(dt) dt[, fare_amount / trip_distance]
+
+# all implementations give the same answer
+ref <- fpm_vector(samp_df)
+stopifnot(all.equal(unname(fpm_apply(samp_df)), ref), all.equal(fpm_lapply(samp_df), ref),
+          all.equal(fpm_map(samp_df), ref), all.equal(fpm_loop(samp_df), ref), all.equal(fpm_dt(samp_dt), ref))
+
+mem_A <- c(`apply()` = peak_mem_mb(fpm_apply(samp_df)), `lapply()` = peak_mem_mb(fpm_lapply(samp_df)),
+           `purrr::map2_dbl()` = peak_mem_mb(fpm_map(samp_df)), `for loop` = peak_mem_mb(fpm_loop(samp_df)),
+           `vectorized` = peak_mem_mb(fpm_vector(samp_df)), `data.table` = peak_mem_mb(fpm_dt(samp_dt)))
+
+mb_A <- microbenchmark(`apply()` = fpm_apply(samp_df), `lapply()` = fpm_lapply(samp_df),
+                       `purrr::map2_dbl()` = fpm_map(samp_df), `for loop` = fpm_loop(samp_df),
+                       `vectorized` = fpm_vector(samp_df), `data.table` = fpm_dt(samp_dt), times = 10)
+add_bench(mb_A, "A: row-level fare per mile", nrow(samp_df), mem_A)
+
+# ### 5.2 Experiment B – grouped aggregation (mean total amount per borough and hour)
+
+grp_lapply <- function(df) {
+  g <- split(df$total_amount, list(df$pu_borough, df$pickup_hour), drop = TRUE)
+  unlist(lapply(g, mean))
+}
+grp_map    <- function(df) purrr::map_dbl(split(df$total_amount, list(df$pu_borough, df$pickup_hour), drop = TRUE), mean)
+grp_sapply <- function(df) {           # conventional: filter the data once per group
+  keys <- unique(df[, c("pu_borough", "pickup_hour")])
+  sapply(seq_len(nrow(keys)), function(k) mean(df$total_amount[df$pu_borough == keys$pu_borough[k] & df$pickup_hour == keys$pickup_hour[k]]))
+}
+grp_tapply    <- function(df) tapply(df$total_amount, list(df$pu_borough, df$pickup_hour), mean)
+grp_aggregate <- function(df) aggregate(total_amount ~ pu_borough + pickup_hour, data = df, FUN = mean)
+grp_dt        <- function(dt) dt[, .(mean_total = mean(total_amount)), by = .(pu_borough, pickup_hour)]
+
+# check: same group means from functional and data.table versions
+chk <- grp_dt(big_dt)[order(pu_borough, pickup_hour)]
+stopifnot(all.equal(unname(grp_lapply(big_df)[paste(chk$pu_borough, chk$pickup_hour, sep = ".")]), chk$mean_total))
+
+mem_B <- c(`lapply(split())` = peak_mem_mb(grp_lapply(big_df)), `purrr::map_dbl(split())` = peak_mem_mb(grp_map(big_df)),
+           `sapply() filter per group` = peak_mem_mb(grp_sapply(big_df)), `tapply()` = peak_mem_mb(grp_tapply(big_df)),
+           `aggregate()` = peak_mem_mb(grp_aggregate(big_df)), `data.table by` = peak_mem_mb(grp_dt(big_dt)))
+
+mb_B <- microbenchmark(`lapply(split())` = grp_lapply(big_df), `purrr::map_dbl(split())` = grp_map(big_df),
+                       `sapply() filter per group` = grp_sapply(big_df), `tapply()` = grp_tapply(big_df),
+                       `aggregate()` = grp_aggregate(big_df), `data.table by` = grp_dt(big_dt), times = 5)
+add_bench(mb_B, "B: grouped mean by borough x hour", nrow(big_df), mem_B)
+
+# ### 5.3 Experiment C – summary statistics over many columns
+# Here the functional approach iterates over **columns** (only a handful of iterations), not rows.
+
+num_vars <- c("fare_amount", "trip_distance", "tip_amount", "total_amount")
+col_apply  <- function(df) apply(df[, num_vars], 2, mean)
+col_lapply <- function(df) unlist(lapply(df[, num_vars], mean))
+col_map    <- function(df) purrr::map_dbl(df[, num_vars], mean)
+col_vector <- function(df) colMeans(df[, num_vars])
+col_dt     <- function(dt) dt[, lapply(.SD, mean), .SDcols = num_vars]
+
+stopifnot(all.equal(col_lapply(big_df), col_vector(big_df)), all.equal(unlist(col_dt(big_dt)), col_vector(big_df)))
+mem_C <- c(`apply(, 2)` = peak_mem_mb(col_apply(big_df)), `lapply()` = peak_mem_mb(col_lapply(big_df)),
+           `purrr::map_dbl()` = peak_mem_mb(col_map(big_df)), `colMeans() vectorized` = peak_mem_mb(col_vector(big_df)),
+           `data.table .SD` = peak_mem_mb(col_dt(big_dt)))
+mb_C <- microbenchmark(`apply(, 2)` = col_apply(big_df), `lapply()` = col_lapply(big_df), `purrr::map_dbl()` = col_map(big_df),
+                       `colMeans() vectorized` = col_vector(big_df), `data.table .SD` = col_dt(big_dt), times = 10)
+add_bench(mb_C, "C: column means (4 columns)", nrow(big_df), mem_C)
+
+# ### 5.4 Comparison of code complexity and readability
+
+data.table(
+  approach      = c("apply()", "lapply() / sapply()", "purrr::map()", "for loop", "Vectorized base R", "data.table"),
+  lines_of_code = c(1, 1, 1, 3, 1, 1),
+  readability   = c("Medium - matrix conversion hidden", "Medium", "High - explicit, type-stable (map_dbl)",
+                    "High for beginners, verbose", "Very high", "High once DT[i, j, by] is learnt"),
+  complexity    = c("Low", "Low", "Low", "Medium (pre-allocation needed)", "Very low", "Low"),
+  memory        = c("High - converts data.frame to matrix", "High - one R call + list element per row",
+                    "High per row, low per column", "Low", "Low - one result vector", "Lowest - in-place, no copies"),
+  large_data    = c("Unsuitable row-wise", "Unsuitable row-wise, fine over columns/groups",
+                    "Unsuitable row-wise, fine over columns/groups", "Unsuitable", "Good", "Best (multi-threaded, by reference)")
+)
+
+# **Why the performance differs**
+#
+# * `apply()` first **coerces the data.frame to a matrix** (copying all values) and then calls an R function once
+#   per row – 200,000 interpreted function calls. `lapply()`, `purrr::map()` and `for` loops avoid the matrix copy
+#   but still pay the cost of one interpreted R call per element plus list allocation.
+# * **Vectorized** arithmetic (`df$fare / df$dist`) performs a single call into compiled C code that loops over
+#   the whole vector – typically **hundreds to thousands of times faster** than the row-wise versions.
+# * For **grouping**, `split()` + `lapply()` is reasonable (the loop is over groups, not rows) but `split()`
+#   copies the data into a list; the "filter per group" `sapply()` scans the full vector once per group;
+#   `aggregate()` has heavy formula/model-frame overhead. **data.table** groups with a radix-sort based algorithm
+#   in C, uses several threads (GForce optimisation for `mean()`), and allocates memory only for the result.
+# * When the functional loop runs over **a few columns** (Experiment C), the call overhead is negligible:
+#   `lapply()` / `map_dbl()` call the compiled `mean()` once per column and are as fast as data.table's `.SD`
+#   and even faster than `colMeans()`, because `colMeans()` and `apply(, 2)` must first convert the
+#   data.frame into a matrix (an extra copy). Functional style is the best choice there.
