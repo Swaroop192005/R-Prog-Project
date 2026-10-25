@@ -695,3 +695,110 @@ light
 #   (which is itself multi-threaded) is faster than both.
 # * Therefore parallel processing pays off only when the computation per partition is large compared with the
 #   communication overhead.
+
+# ---
+# ## 7. Task 5 – Performance Benchmarking and Optimization
+#
+# ### 7.1 Base R vs data.table on the full dataset
+# Typical operations on all ≈ 20 million trips: filtering, grouped aggregation, sorting and joining.
+# A base-R `data.frame` copy of the needed columns is used for the base-R versions.
+
+full_df <- as.data.frame(trips[, .(PULocationID, pickup_hour, month, fare_amount, total_amount, trip_distance)])
+full_dt <- as.data.table(full_df)
+zones_df <- as.data.frame(zones)
+n_full <- nrow(full_df)
+
+mb_filter <- microbenchmark(
+  `base R df[cond, ]`       = full_df[full_df$trip_distance > 10 & full_df$fare_amount > 50, ],
+  `base R subset()`         = subset(full_df, trip_distance > 10 & fare_amount > 50),
+  `data.table DT[cond]`     = full_dt[trip_distance > 10 & fare_amount > 50], times = 5)
+add_bench(mb_filter, "D: filter long expensive trips", n_full)
+
+mb_group <- microbenchmark(
+  `base R aggregate()`      = aggregate(total_amount ~ month + pickup_hour, data = full_df, FUN = sum),
+  `base R tapply()`         = tapply(full_df$total_amount, list(full_df$month, full_df$pickup_hour), sum),
+  `data.table by`           = full_dt[, .(revenue = sum(total_amount)), by = .(month, pickup_hour)], times = 3)
+add_bench(mb_group, "E: revenue by month x hour", n_full)
+
+mb_sort <- microbenchmark(
+  `base R order()`          = full_df[order(-full_df$total_amount), ],
+  `data.table setorder()`   = setorder(copy(full_dt), -total_amount),
+  `data.table DT[order()]`  = full_dt[order(-total_amount)], times = 3)
+add_bench(mb_sort, "F: sort by total amount", n_full)
+
+join_n  <- 2e6
+join_df <- full_df[seq_len(join_n), ]
+join_dt <- full_dt[seq_len(join_n)]
+mem_join <- c(`base R merge()` = peak_mem_mb(merge(join_df, zones_df, by.x = "PULocationID", by.y = "LocationID", all.x = TRUE)),
+              `base R match()` = peak_mem_mb({j <- join_df; j$Borough <- zones_df$Borough[match(j$PULocationID, zones_df$LocationID)]; j}),
+              `data.table join` = peak_mem_mb(zones[join_dt, on = .(LocationID = PULocationID)]),
+              `data.table update join :=` = peak_mem_mb(join_dt[zones, on = .(PULocationID = LocationID), Borough := i.Borough]))
+mb_join <- microbenchmark(
+  `base R merge()`          = merge(join_df, zones_df, by.x = "PULocationID", by.y = "LocationID", all.x = TRUE),
+  `base R match()`          = {j <- join_df; j$Borough <- zones_df$Borough[match(j$PULocationID, zones_df$LocationID)]; j},
+  `data.table join`         = zones[join_dt, on = .(LocationID = PULocationID)],
+  `data.table update join :=` = join_dt[zones, on = .(PULocationID = LocationID), Borough := i.Borough], times = 3)
+add_bench(mb_join, "G: join 2M trips with zones", join_n, mem_join)
+
+# ### 7.2 Scalability – execution time vs number of rows
+# The grouped aggregation (mean fare by pickup zone) is run on increasing subsets.
+
+sizes <- c(1e5, 5e5, 1e6, 5e6, 1e7, n_full)
+scal <- rbindlist(lapply(sizes, function(n) {
+  df <- full_df[seq_len(n), c("PULocationID", "fare_amount")]
+  dt <- full_dt[seq_len(n), .(PULocationID, fare_amount)]
+  t <- summary(microbenchmark(
+    `lapply(split())` = lapply(split(df$fare_amount, df$PULocationID), mean),
+    `tapply()`        = tapply(df$fare_amount, df$PULocationID, mean),
+    `aggregate()`     = aggregate(fare_amount ~ PULocationID, data = df, FUN = mean),
+    `data.table by`   = dt[, mean(fare_amount), by = PULocationID], times = 3), unit = "ms")
+  data.table(rows = n, approach = as.character(t$expr), median_ms = t$median)
+}))
+dcast(scal, rows ~ approach, value.var = "median_ms")[, lapply(.SD, round, 1)]
+
+# ### 7.3 Consolidated execution-time comparison table
+
+par_tbl <- data.table(approach = c("Sequential lapply()", "Sequential foreach %do%", sprintf("Parallel foreach %%dopar%% (%d cores)", N_CORES)),
+                      median_ms = round(1000 * c(t_seq[["elapsed"]], t_seq_foreach[["elapsed"]], t_par[["elapsed"]]), 1),
+                      comparison = "H: bootstrap per month (sequential vs parallel)", rows = nrow(trips))
+bench_all <- rbindlist(c(bench_results, list(par_tbl)), fill = TRUE)
+bench_all[, relative_to_best := round(median_ms / min(median_ms), 1), by = comparison]
+bench_all <- bench_all[order(comparison, median_ms), .(comparison, rows, approach, median_ms, relative_to_best, peak_mem_MB)]
+fwrite(bench_all, file.path(OUT_DIR, "benchmark_results.csv"))
+fwrite(scaling, file.path(OUT_DIR, "parallel_scaling.csv"))
+bench_all
+
+# head-to-head summary for the four required comparisons
+best_of <- function(cmp, pattern) bench_all[comparison == cmp & grepl(pattern, approach), min(median_ms)]
+summary_tbl <- data.table(
+  comparison = c("Base R vs data.table (grouping, 20M rows)", "Base R vs data.table (join, 2M rows)",
+                 "Functional vs vectorized (row-level)", "Functional vs data.table (grouping)", "Sequential vs parallel (bootstrap)"),
+  slower_approach_ms = c(best_of("E: revenue by month x hour", "aggregate"), best_of("G: join 2M trips with zones", "merge"),
+                         best_of("A: row-level fare per mile", "lapply"), best_of("B: grouped mean by borough x hour", "lapply"),
+                         1000 * t_seq[["elapsed"]]),
+  faster_approach_ms = c(best_of("E: revenue by month x hour", "data.table"), best_of("G: join 2M trips with zones", "data.table"),
+                         best_of("A: row-level fare per mile", "vectorized"), best_of("B: grouped mean by borough x hour", "data.table"),
+                         1000 * t_par[["elapsed"]]))
+summary_tbl[, speedup := round(slower_approach_ms / faster_approach_ms, 1)]
+summary_tbl[, (2:3) := lapply(.SD, round, 1), .SDcols = 2:3]
+summary_tbl
+
+# **Analysis**
+#
+# * **Execution time:** data.table is the fastest approach for filtering, grouping and sorting, and its joins are
+#   one to two orders of magnitude faster than `merge()`; grouped aggregation is far faster than `aggregate()`.
+#   For a *single-column lookup* the vectorized base-R `match()` is even faster than a data.table join, because it
+#   only builds one integer index – a good example that a well-chosen vectorized primitive is hard to beat,
+#   whereas data.table's join is the general tool for multi-column / many-to-many joins. For row-level
+#   arithmetic, vectorized base R and data.table are equivalent and both are thousands of times faster than
+#   `apply()` / `lapply()` / `map()`.
+# * **Memory:** `merge()` and `aggregate()` create several intermediate copies; data.table joins and especially the
+#   **update join `:=`** add a column in place, so the peak extra memory is only the size of the new column.
+#   `apply()` needs an extra matrix copy of the data.
+# * **Scalability:** all approaches grow roughly linearly with the number of rows, but with very different slopes –
+#   at 20 million rows `aggregate()` needs many seconds while `data.table` stays well below a second, so the
+#   gap widens as the data grows.
+# * **Programming complexity / readability:** vectorized code and data.table one-liners are both short and
+#   readable. `purrr::map_*()` is the most explicit and type-safe functional style but is slow when used per row.
+#   Parallel code adds the most complexity (cluster set-up, exporting functions/packages, seeds, cleanup)
+#   and only pays off for heavy, independent computations.
