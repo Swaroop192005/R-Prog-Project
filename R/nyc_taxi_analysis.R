@@ -75,6 +75,8 @@ required <- c("data.table", "arrow", "ggplot2", "foreach", "doParallel", "microb
 missing_pkgs <- required[!vapply(required, requireNamespace, logical(1), quietly = TRUE)]
 if (length(missing_pkgs) > 0) install.packages(missing_pkgs, repos = "https://cloud.r-project.org")
 
+Sys.setenv(TZ = "UTC")
+Sys.setenv(ARROW_DEFAULT_MEMORY_POOL = "system")   # let arrow return memory to the OS after import
 suppressPackageStartupMessages({
   library(data.table)
   library(arrow)
@@ -87,7 +89,6 @@ suppressPackageStartupMessages({
   library(scales)
 })
 
-Sys.setenv(TZ = "UTC")
 set.seed(2024)
 options(repr.plot.width = 12, repr.plot.height = 6, scipen = 999, width = 140)
 
@@ -200,49 +201,44 @@ trips[is.na(passenger_count), .N, by = payment_type]
 # | Impossible speed | average speed > 80 mph | remove |
 # | Invalid zone IDs | outside 1–265 | remove |
 
-clean_log <- data.table(step = "Raw records", rows = nrow(trips))
-log_step  <- function(step) clean_log <<- rbind(clean_log, data.table(step = step, rows = nrow(trips)))
+# Memory-efficient cleaning: every rule only updates one logical "keep" vector (80 MB for 20M rows)
+# and the large table is subset ONCE at the end, instead of being copied after every rule.
+n_raw     <- nrow(trips)
+keep      <- rep(TRUE, n_raw)
+clean_log <- data.table(step = "Raw records", removed = 0L)
+apply_rule <- function(step, ok) {
+  ok[is.na(ok)] <- FALSE
+  clean_log <<- rbind(clean_log, data.table(step = step, removed = sum(keep & !ok)))
+  keep <<- keep & ok
+}
 
-# 1. exact duplicates (on the identifying columns)
-trips <- unique(trips, by = c("VendorID", "tpep_pickup_datetime", "tpep_dropoff_datetime",
-                              "PULocationID", "DOLocationID", "trip_distance", "total_amount"))
-log_step("Remove duplicate trips")
+# trip duration in minutes (vectorized, added by reference)
+trips[, trip_duration_min := as.numeric(tpep_dropoff_datetime - tpep_pickup_datetime, units = "mins")]
 
-# 2. pickups outside the analysis period
 period_start <- as.POSIXct("2024-01-01 00:00:00", tz = "UTC")
 period_end   <- as.POSIXct("2024-07-01 00:00:00", tz = "UTC")
-trips <- trips[tpep_pickup_datetime >= period_start & tpep_pickup_datetime < period_end]
-log_step("Remove pickups outside Jan-Jun 2024")
 
-# 3. impute missing / zero passenger count and missing rate code (update by reference)
+apply_rule("Remove duplicate trips", !duplicated(trips, by = c("VendorID", "tpep_pickup_datetime", "tpep_dropoff_datetime",
+                                                               "PULocationID", "DOLocationID", "trip_distance", "total_amount")))
+apply_rule("Remove pickups outside Jan-Jun 2024", trips[, tpep_pickup_datetime >= period_start & tpep_pickup_datetime < period_end])
+apply_rule("Remove invalid fare / total / tip / tolls",
+           trips[, fare_amount > 0 & fare_amount <= 500 & total_amount > 0 & tip_amount >= 0 & tolls_amount >= 0])
+apply_rule("Remove invalid trip distance", trips[, trip_distance > 0 & trip_distance <= 100])
+apply_rule("Remove invalid trip duration", trips[, trip_duration_min > 0 & trip_duration_min <= 180])
+apply_rule("Remove speed > 80 mph", trips[, trip_distance / (trip_duration_min / 60) <= 80])
+apply_rule("Remove invalid zone IDs", trips[, PULocationID %between% c(1L, 265L) & DOLocationID %between% c(1L, 265L)])
+
+trips <- trips[keep]          # the only copy of the large table
+rm(keep); invisible(gc())
+
+# impute missing / zero passenger count and missing rate code (update by reference)
 n_pass_fixed <- trips[is.na(passenger_count) | passenger_count == 0, .N]
 trips[is.na(passenger_count) | passenger_count == 0, passenger_count := 1L]
 trips[is.na(RatecodeID), RatecodeID := 99L]
 cat("Passenger count imputed for", format(n_pass_fixed, big.mark = ","), "rows\n")
 
-# 4. invalid amounts
-trips <- trips[fare_amount > 0 & fare_amount <= 500 & total_amount > 0 & tip_amount >= 0 & tolls_amount >= 0]
-log_step("Remove invalid fare / total / tip / tolls")
-
-# 5. invalid distance
-trips <- trips[trip_distance > 0 & trip_distance <= 100]
-log_step("Remove invalid trip distance")
-
-# 6. invalid duration (computed by reference, vectorized)
-trips[, trip_duration_min := as.numeric(tpep_dropoff_datetime - tpep_pickup_datetime, units = "mins")]
-trips <- trips[trip_duration_min > 0 & trip_duration_min <= 180]
-log_step("Remove invalid trip duration")
-
-# 7. impossible speed
-trips <- trips[trip_distance / (trip_duration_min / 60) <= 80]
-log_step("Remove speed > 80 mph")
-
-# 8. invalid zone IDs
-trips <- trips[PULocationID %between% c(1L, 265L) & DOLocationID %between% c(1L, 265L)]
-log_step("Remove invalid zone IDs")
-
-clean_log[, removed := shift(rows, fill = rows[1]) - rows]
-clean_log[, pct_of_raw := round(100 * rows / rows[1], 2)]
+clean_log[, rows_left := n_raw - cumsum(removed)]
+clean_log[, pct_of_raw := round(100 * rows_left / n_raw, 2)]
 clean_log
 
 # ### 3.4 Convert attributes into appropriate data types
@@ -321,11 +317,11 @@ trips[, .(trips = .N), by = pu_borough][order(-trips)]
 
 str(trips)
 cat(sprintf("\nFinal dataset: %s trips (%.1f %% of raw records kept), %s in memory\n",
-            format(nrow(trips), big.mark = ","), 100 * nrow(trips) / clean_log$rows[1],
+            format(nrow(trips), big.mark = ","), 100 * nrow(trips) / n_raw,
             format(object.size(trips), units = "auto")))
 
 # **Interpretation:** after removing duplicates, out-of-period, invalid and implausible records about
-# 95 % of the raw records remain, so the cleaning removes noise without biasing the dataset. Converting codes to
+# 97 % of the raw records remain, so the cleaning removes noise without biasing the dataset. Converting codes to
 # factors and dropping unused columns reduces the memory footprint, and every expensive step (feature creation,
 # imputation, joins) was done **by reference** with data.table, which avoids copying a multi-gigabyte table.
 
@@ -398,11 +394,11 @@ trips[, .(trips = .N, revenue_musd = round(sum(total_amount) / 1e6, 1)),
 # ### 4.7 Relationship between trip distance and fare amount
 
 cat("Pearson correlation (distance, fare)  :", round(trips[, cor(trip_distance, fare_amount)], 3), "\n")
-samp_cor <- trips[sample(.N, 1e6)]
+samp_cor <- trips[sample(.N, 1e6), .(trip_distance, fare_amount)]
 cat("Spearman correlation (1M-row sample)   :", round(samp_cor[, cor(trip_distance, fare_amount, method = "spearman")], 3), "\n")
 
-fit <- lm(fare_amount ~ trip_distance, data = trips[RatecodeID == "Standard"])
-cat(sprintf("Linear model (standard rate): fare = %.2f + %.2f x miles, R^2 = %.3f\n",
+fit <- lm(fare_amount ~ trip_distance, data = trips[RatecodeID == "Standard", .(fare_amount, trip_distance)][sample(.N, 1e6)])
+cat(sprintf("Linear model (standard rate, 1M-row sample): fare = %.2f + %.2f x miles, R^2 = %.3f\n",
             coef(fit)[1], coef(fit)[2], summary(fit)$r.squared))
 
 dist_bands <- trips[, .(trips = .N, avg_fare = round(mean(fare_amount), 2), median_fare = median(fare_amount),
@@ -445,20 +441,22 @@ rbind(daily[order(-trips)][1:3][, type := "busiest"], daily[order(trips)][1:3][,
 # * **Hourly demand** follows a clear commuter/leisure cycle: demand is lowest around 4–5 AM, builds through
 #   the morning and peaks in the late afternoon / early evening (≈ 17–18 h). Average fares are highest in the
 #   early morning because those trips are longer (airport and outer-borough runs).
-# * **Day of week:** weekdays (especially Wed–Thu) have the highest average trips per day, Sunday the lowest.
+# * **Day of week:** Thursday has the highest average trips per day, followed by Saturday, Wednesday and Friday;
+#   Monday and Sunday are the quietest (several Monday public holidays fall in this period).
 #   The weekday/weekend hourly profile shows weekend demand shifted to late night (0–3 h).
 # * **Monthly:** demand rises from January to spring (March–May are the busiest), reflecting winter
 #   seasonality and tourism; June stays high.
-# * **Revenue by period:** the midday and evening-rush periods generate most of the revenue, while early-morning
-#   trips have the highest revenue per trip.
+# * **Revenue by period:** the midday (≈ 32 %) and evening-rush (≈ 27 %) periods generate most of the revenue;
+#   the amount per trip is similar in all periods (≈ 27–29 USD), but early-morning trips are the longest.
 # * **Routes:** the most frequent routes are short trips inside Manhattan's Upper East Side; the
 #   **highest-revenue routes all involve JFK / LaGuardia airports** – airport trips are a small share of trips
 #   but a much larger share of revenue.
-# * **Distance vs fare:** a strong positive, almost linear relationship (fare ≈ base + ≈ 4–5 USD per mile under the
-#   standard rate) with high R², but the **fare per mile falls** sharply with distance because of the fixed
+# * **Distance vs fare:** a strong positive, almost linear relationship (correlation ≈ 0.94; under the standard
+#   rate fare ≈ 6 USD + ≈ 3.9 USD per mile, R² ≈ 0.92), but the **fare per mile falls** sharply with distance because of the fixed
 #   base charge and time-based charges on short congested trips.
-# * **Payment:** credit cards dominate (≈ 80 % of trips); cash is relatively more common in the outer
-#   boroughs. Recorded tips are almost exclusively on card payments.
+# * **Payment:** credit cards dominate (about three quarters of trips), cash is ≈ 13 %. Cash is used more in
+#   Queens than in Manhattan, while Bronx and Brooklyn pickups have a very high "flex/unknown" share (no payment
+#   type recorded). Recorded tips are almost exclusively on card payments, because cash tips are not metered.
 # * **Other patterns:** taxis are slowest in the afternoon (congestion) and fastest early in the morning;
 #   most trips carry a single passenger; holidays and storms produce the quietest days.
 
@@ -591,6 +589,7 @@ data.table(
 # The dataset is divided into **month-wise partitions** (6 subsets of ≈ 3 million trips). Only the columns needed
 # by the analysis are kept so that less data has to be sent to the worker processes.
 
+rm(samp_dt, samp_df, big_dt, big_df, samp_cor, fit); invisible(gc())   # free Task 3 objects
 parts <- split(trips[, .(month, pu_borough, fare_amount, total_amount, trip_distance, trip_duration_min, tip_amount)],
                by = "month", keep.by = TRUE, drop = TRUE)
 data.table(month = names(parts), rows = sapply(parts, nrow), size_MB = round(sapply(parts, function(p) object.size(p)) / 2^20, 1))
@@ -657,7 +656,7 @@ core_grid <- unique(c(1L, 2L, seq(2L, N_CORES, by = 2L), N_CORES))
 scaling <- rbindlist(lapply(core_grid, function(k) {
   cl_k <- makeCluster(k); registerDoParallel(cl_k)
   invisible(clusterEvalQ(cl_k, library(data.table)))
-  el <- system.time(foreach(d = parts, .combine = rbind, .packages = "data.table", .export = "B") %dopar%
+  el <- system.time(foreach(d = parts, .combine = rbind, .packages = "data.table", .export = c("analyse_partition", "B")) %dopar%
                       analyse_partition(d, B = B))[["elapsed"]]
   stopCluster(cl_k)
   data.table(cores = k, parallel_s = el)
@@ -703,27 +702,32 @@ light
 # Typical operations on all ≈ 20 million trips: filtering, grouped aggregation, sorting and joining.
 # A base-R `data.frame` copy of the needed columns is used for the base-R versions.
 
-full_df <- as.data.frame(trips[, .(PULocationID, pickup_hour, month, fare_amount, total_amount, trip_distance)])
-full_dt <- as.data.table(full_df)
+rm(parts); invisible(gc())   # free Task 4 partitions
+full_dt <- trips[, .(PULocationID, pickup_hour, month, fare_amount, total_amount, trip_distance)]
+full_df <- setDF(copy(full_dt))   # plain data.frame for the base-R versions
 zones_df <- as.data.frame(zones)
 n_full <- nrow(full_df)
 
+invisible(gc())
+cat("data.table threads:", getDTthreads(), "\n")
 mb_filter <- microbenchmark(
   `base R df[cond, ]`       = full_df[full_df$trip_distance > 10 & full_df$fare_amount > 50, ],
   `base R subset()`         = subset(full_df, trip_distance > 10 & fare_amount > 50),
-  `data.table DT[cond]`     = full_dt[trip_distance > 10 & fare_amount > 50], times = 5)
+  `data.table DT[cond]`     = full_dt[trip_distance > 10 & fare_amount > 50], times = 7)
 add_bench(mb_filter, "D: filter long expensive trips", n_full)
 
+invisible(gc())
 mb_group <- microbenchmark(
   `base R aggregate()`      = aggregate(total_amount ~ month + pickup_hour, data = full_df, FUN = sum),
   `base R tapply()`         = tapply(full_df$total_amount, list(full_df$month, full_df$pickup_hour), sum),
-  `data.table by`           = full_dt[, .(revenue = sum(total_amount)), by = .(month, pickup_hour)], times = 3)
+  `data.table by`           = full_dt[, .(revenue = sum(total_amount)), by = .(month, pickup_hour)], times = 7)
 add_bench(mb_group, "E: revenue by month x hour", n_full)
 
+invisible(gc())
 mb_sort <- microbenchmark(
   `base R order()`          = full_df[order(-full_df$total_amount), ],
   `data.table setorder()`   = setorder(copy(full_dt), -total_amount),
-  `data.table DT[order()]`  = full_dt[order(-total_amount)], times = 3)
+  `data.table DT[order()]`  = full_dt[order(-total_amount)], times = 5)
 add_bench(mb_sort, "F: sort by total amount", n_full)
 
 join_n  <- 2e6
@@ -766,6 +770,7 @@ bench_all[, relative_to_best := round(median_ms / min(median_ms), 1), by = compa
 bench_all <- bench_all[order(comparison, median_ms), .(comparison, rows, approach, median_ms, relative_to_best, peak_mem_MB)]
 fwrite(bench_all, file.path(OUT_DIR, "benchmark_results.csv"))
 fwrite(scaling, file.path(OUT_DIR, "parallel_scaling.csv"))
+rm(full_df, full_dt, join_df, join_dt); invisible(gc())
 bench_all
 
 # head-to-head summary for the four required comparisons
@@ -871,8 +876,10 @@ save_plot(p, "05_revenue_trend")
 top_pu <- trips[, .N, by = pu_zone][order(-N)][1:10]
 top_do <- trips[, .N, by = do_zone][order(-N)][1:10]
 top_zones <- rbind(top_pu[, .(zone = pu_zone, N, type = "Pickup")], top_do[, .(zone = do_zone, N, type = "Drop-off")])
-p <- ggplot(top_zones, aes(reorder(zone, N), N / 1e3, fill = type)) + geom_col(show.legend = FALSE) + coord_flip() +
+top_zones[, zone_in_panel := reorder(paste(zone, type, sep = "___"), N)]   # sort bars separately in each panel
+p <- ggplot(top_zones, aes(zone_in_panel, N / 1e3, fill = type)) + geom_col(show.legend = FALSE) + coord_flip() +
   facet_wrap(~ factor(type, c("Pickup", "Drop-off")), scales = "free_y") +
+  scale_x_discrete(labels = function(x) sub("___.*$", "", x)) +
   scale_fill_manual(values = c(Pickup = "#1F4E79", `Drop-off` = "#E07A00")) +
   labs(title = "6-7. Top 10 pickup and drop-off zones", x = NULL, y = "Number of trips (thousands)")
 save_plot(p, "06_07_top_pickup_dropoff_zones", width = 13)
@@ -893,7 +900,7 @@ p <- ggplot(rr, aes(reorder(route, revenue_musd), revenue_musd)) + geom_col(fill
        x = NULL, y = "Revenue (million USD)")
 save_plot(p, "09_top_revenue_routes", width = 12)
 
-# *Short Upper-East-Side hops are the most frequent routes, but the money is made on airport routes, which earn 4–6× more per trip.*
+# *Short Upper-East-Side hops are the most frequent routes, but the money is made on airport routes, which earn several times more per trip.*
 
 pb <- pay_borough[pu_borough != "EWR"]
 p <- ggplot(pb, aes(pu_borough, share_pct, fill = payment_type)) + geom_col(position = "fill") +
@@ -914,9 +921,16 @@ save_plot(p, "11_distance_vs_fare")
 # *Fare rises almost linearly with distance. The horizontal band at ≈ 70 USD is the JFK–Manhattan flat fare.*
 
 bp <- bench_all[comparison %in% c("A: row-level fare per mile", "B: grouped mean by borough x hour", "E: revenue by month x hour", "G: join 2M trips with zones")]
-p <- ggplot(bp, aes(reorder(approach, median_ms), median_ms, fill = grepl("data.table|vectorized|colMeans", approach))) +
-  geom_col(show.legend = FALSE) + coord_flip() + facet_wrap(~ comparison, scales = "free", ncol = 2) +
-  scale_y_log10(labels = comma) + scale_fill_manual(values = c(`FALSE` = "grey60", `TRUE` = "#27AE60")) +
+bp[, fast_style := grepl("data.table|vectorized", approach)]
+bp[, approach_in_panel := reorder(paste(approach, comparison, sep = "___"), median_ms)]   # sort within each panel
+p <- ggplot(bp, aes(approach_in_panel, median_ms, colour = fast_style)) +
+  geom_segment(aes(xend = approach_in_panel, y = 0.1, yend = median_ms), linewidth = 1.2, show.legend = FALSE) +
+  geom_point(size = 3.5, show.legend = FALSE) +
+  geom_text(aes(label = ifelse(median_ms >= 10, comma(median_ms, accuracy = 1), round(median_ms, 2))), hjust = -0.3, size = 3.4, colour = "black") +
+  coord_flip() + facet_wrap(~ comparison, scales = "free_y", ncol = 2) +
+  scale_x_discrete(labels = function(x) sub("___.*$", "", x)) +
+  scale_y_log10(labels = comma, expand = expansion(mult = c(0, 0.25))) +
+  scale_colour_manual(values = c(`FALSE` = "grey55", `TRUE` = "#27AE60")) +
   labs(title = "12. Benchmark: execution time of different R approaches", subtitle = "Median of repeated runs, log scale (green = vectorized / data.table)",
        x = NULL, y = "Median execution time (ms, log scale)")
 save_plot(p, "12_benchmark_comparison", width = 14, height = 8)
@@ -953,7 +967,7 @@ zones_sf <- merge(zones_sf, zone_stats, by = "LocationID", all.x = TRUE)
 
 p <- ggplot(zones_sf) + geom_sf(aes(fill = pickups), colour = "white", linewidth = 0.05) +
   scale_fill_viridis_c(trans = "log10", labels = comma, name = "Pickups (log)", na.value = "grey90") +
-  labs(title = "15. Pickups by taxi zone, Jan-Jun 2024") + theme_void(base_size = 13) + theme(legend.position = "right")
+  labs(title = "15. Pickups by taxi zone, Jan-Jun 2024") + theme_void(base_size = 13) + theme(legend.position = "right", plot.title = element_text(face = "bold"))
 save_plot(p, "15_pickup_map", width = 9, height = 9)
 
 top_sf <- zones_sf[order(-zones_sf$revenue), ][1:25, ]
@@ -977,7 +991,7 @@ m
 # ## 9. Observations
 # The key measured numbers from this run are collected below (they will vary slightly between machines).
 
-bm <- function(cmp, pattern) bench_all[comparison == cmp & grepl(pattern, approach, fixed = TRUE), median_ms][1]
+bm <- function(cmp, appr) bench_all[comparison == cmp & approach == appr, median_ms]
 obs <- data.table(
   metric = c("Trips analysed (after cleaning)", "Peak pickup hour", "Busiest weekday (avg trips/day)", "Busiest month (avg trips/day)",
              "Top revenue route", "Credit-card share of trips (%)", "Distance-fare correlation",
@@ -989,9 +1003,9 @@ obs <- data.table(
             top_rev_routes[1, paste(pu_zone, "->", do_zone)], pay_overall[payment_type == "Credit card", share_pct],
             round(trips[, cor(trip_distance, fare_amount)], 3),
             round(bm("A: row-level fare per mile", "apply()") / bm("A: row-level fare per mile", "vectorized")),
-            round(bm("B: grouped mean by borough x hour", "lapply(split())") / bm("B: grouped mean by borough x hour", "data.table")),
-            round(bm("E: revenue by month x hour", "aggregate()") / bm("E: revenue by month x hour", "data.table")),
-            round(bm("G: join 2M trips with zones", "merge()") / bm("G: join 2M trips with zones", "data.table join")),
+            round(bm("B: grouped mean by borough x hour", "lapply(split())") / bm("B: grouped mean by borough x hour", "data.table by")),
+            round(bm("E: revenue by month x hour", "base R aggregate()") / bm("E: revenue by month x hour", "data.table by")),
+            round(bm("G: join 2M trips with zones", "base R merge()") / bm("G: join 2M trips with zones", "data.table join")),
             paste0(speedup_main, "x"), paste0(light[2, speedup_vs_seq], "x")))
 obs
 
@@ -1000,8 +1014,8 @@ obs
 # 2. **Revenue** is concentrated in the midday and evening-rush periods, while **airport routes** (JFK,
 #    LaGuardia) generate by far the highest revenue per trip and dominate the highest-revenue routes.
 # 3. **Fare vs distance** is strongly linear, but the fare per mile is highest for very short trips.
-# 4. **Payments:** credit cards account for roughly four out of five trips; cash is used relatively more in the outer
-#    boroughs, and tips are recorded almost only for card payments.
+# 4. **Payments:** credit cards account for about three quarters of trips; cash and unrecorded ("flex/unknown")
+#    payments are relatively more common outside Manhattan, and tips are recorded almost only for card payments.
 # 5. **Performance:** data.table and vectorized operations were faster than functional row-wise code by orders of
 #    magnitude; data.table beat base R `aggregate()`/`merge()` by a large factor while using less memory;
 #    parallel processing gave a real but sub-linear speedup for the heavy bootstrap and was slower for the light task.
