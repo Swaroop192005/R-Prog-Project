@@ -1,0 +1,12 @@
+# raw data is downloaded by the notebook
+data/
+
+# Jupyter / R
+.ipynb_checkpoints/
+.Rhistory
+.RData
+.Rproj.user/
+*_files/
+
+# OS
+.DS_Store
