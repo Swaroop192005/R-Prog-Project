@@ -802,3 +802,173 @@ summary_tbl
 #   readable. `purrr::map_*()` is the most explicit and type-safe functional style but is slow when used per row.
 #   Parallel code adds the most complexity (cluster set-up, exporting functions/packages, seeds, cleanup)
 #   and only pays off for heavy, independent computations.
+
+# ---
+# ## 8. Task 6 – Data Visualization (ggplot2)
+# All figures are also saved as PNG files in `outputs/figures/`.
+
+p <- ggplot(hourly, aes(pickup_hour, trips / 1e3)) +
+  geom_col(fill = "#F2B705") +
+  geom_line(aes(y = avg_fare * max(trips / 1e3) / max(avg_fare), colour = "Average fare (right axis)"), linewidth = 1.1, group = 1) +
+  scale_colour_manual(values = "#1F4E79", name = NULL) +
+  scale_x_continuous(breaks = 0:23) +
+  scale_y_continuous(labels = comma, sec.axis = sec_axis(~ . * max(hourly$avg_fare) / max(hourly$trips / 1e3), name = "Average fare (USD)")) +
+  labs(title = "1. Number of taxi trips by hour of day", subtitle = "NYC Yellow Taxi, Jan-Jun 2024",
+       x = "Pickup hour (0-23)", y = "Number of trips (thousands)")
+save_plot(p, "01_trips_by_hour")
+
+# *Demand is lowest at 4–5 AM and peaks at 17–18 h; average fares are highest in the early morning when trips are longer.*
+
+p <- ggplot(dow, aes(pickup_wday, avg_trips_per_day / 1e3, fill = pickup_wday %in% c("Sat", "Sun"))) +
+  geom_col() +
+  geom_text(aes(label = comma(avg_trips_per_day)), vjust = -0.4, size = 4) +
+  scale_fill_manual(values = c(`FALSE` = "#1F4E79", `TRUE` = "#F2B705"), labels = c("Weekday", "Weekend"), name = NULL) +
+  labs(title = "2. Taxi demand by day of week", subtitle = "Average number of trips per calendar day",
+       x = "Day of week", y = "Average trips per day (thousands)")
+save_plot(p, "02_demand_by_weekday")
+
+wk <- melt(dcast(dow_hour, pickup_hour ~ ifelse(is_weekend, "Weekend", "Weekday"), value.var = "trips_per_day"),
+           id.vars = "pickup_hour", variable.name = "day_type", value.name = "trips_per_day")
+p <- ggplot(wk, aes(pickup_hour, trips_per_day, colour = day_type)) + geom_line(linewidth = 1.2) + geom_point() +
+  scale_colour_manual(values = c(Weekday = "#1F4E79", Weekend = "#E07A00"), name = "Day type") +
+  scale_x_continuous(breaks = 0:23) + scale_y_continuous(labels = comma) +
+  labs(title = "2b. Hourly demand profile: weekdays vs weekends", x = "Pickup hour (0-23)", y = "Average trips per day")
+save_plot(p, "02b_weekday_vs_weekend_hourly")
+
+# *Weekdays show morning and evening commuter peaks; weekends have no morning peak but much higher late-night demand (0–3 h).*
+
+p <- ggplot(monthly, aes(month, trips_per_day / 1e3)) +
+  geom_col(fill = "#1F4E79") +
+  geom_text(aes(label = paste0(comma(trips_per_day), "\n(", revenue_musd, " M USD)")), vjust = -0.2, size = 3.6) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.2))) +
+  labs(title = "3. Monthly taxi demand", subtitle = "Average trips per day (labels: trips/day and monthly revenue)",
+       x = "Month (2024)", y = "Average trips per day (thousands)")
+save_plot(p, "03_monthly_demand")
+
+# *January and February are the quietest months; demand peaks in spring (March–May).*
+
+fare_trend <- trips[, .(avg_fare = mean(fare_amount), avg_total = mean(total_amount)), by = .(month, time_period)]
+p <- ggplot(fare_trend, aes(month, avg_fare, colour = time_period, group = time_period)) +
+  geom_line(linewidth = 1.1) + geom_point(size = 2) +
+  scale_colour_brewer(palette = "Dark2", name = "Time period") +
+  labs(title = "4. Average fare trends by month and time of day", x = "Month (2024)", y = "Average fare amount (USD)") +
+  guides(colour = guide_legend(nrow = 2))
+save_plot(p, "04_average_fare_trends")
+
+# *Early-morning trips are consistently the most expensive on average; fares are stable across months.*
+
+daily[, rev_7d := frollmean(revenue, 7, align = "center")]
+p <- ggplot(daily, aes(as.Date(pickup_date))) +
+  geom_line(aes(y = revenue / 1e6, colour = "Daily revenue"), alpha = 0.5) +
+  geom_line(aes(y = rev_7d / 1e6, colour = "7-day moving average"), linewidth = 1.2, na.rm = TRUE) +
+  scale_colour_manual(values = c(`Daily revenue` = "grey50", `7-day moving average` = "#C0392B"), name = NULL) +
+  scale_x_date(date_breaks = "1 month", date_labels = "%b") +
+  labs(title = "5. Revenue trend", subtitle = "Total amount collected per day", x = "Date (2024)", y = "Revenue (million USD)")
+save_plot(p, "05_revenue_trend")
+
+# *Revenue shows a strong weekly cycle and dips on holidays (e.g. New Year, Memorial Day) and stormy days.*
+
+top_pu <- trips[, .N, by = pu_zone][order(-N)][1:10]
+top_do <- trips[, .N, by = do_zone][order(-N)][1:10]
+top_zones <- rbind(top_pu[, .(zone = pu_zone, N, type = "Pickup")], top_do[, .(zone = do_zone, N, type = "Drop-off")])
+p <- ggplot(top_zones, aes(reorder(zone, N), N / 1e3, fill = type)) + geom_col(show.legend = FALSE) + coord_flip() +
+  facet_wrap(~ factor(type, c("Pickup", "Drop-off")), scales = "free_y") +
+  scale_fill_manual(values = c(Pickup = "#1F4E79", `Drop-off` = "#E07A00")) +
+  labs(title = "6-7. Top 10 pickup and drop-off zones", x = NULL, y = "Number of trips (thousands)")
+save_plot(p, "06_07_top_pickup_dropoff_zones", width = 13)
+
+# *Midtown/Upper East Side and JFK dominate pickups; drop-offs are spread over residential Manhattan zones.*
+
+tr <- copy(top_routes[1:10])[, route := paste(pu_zone, "->", do_zone)]
+p <- ggplot(tr, aes(reorder(route, trips), trips / 1e3)) + geom_col(fill = "#2E86C1") + coord_flip() +
+  geom_text(aes(label = paste0(avg_distance, " mi")), hjust = 1.1, colour = "white", size = 3.5) +
+  labs(title = "8. Most frequently travelled routes", subtitle = "Labels show average trip distance",
+       x = NULL, y = "Number of trips (thousands)")
+save_plot(p, "08_top_routes", width = 12)
+
+rr <- copy(top_rev_routes[1:10])[, route := paste(pu_zone, "->", do_zone)]
+p <- ggplot(rr, aes(reorder(route, revenue_musd), revenue_musd)) + geom_col(fill = "#C0392B") + coord_flip() +
+  geom_text(aes(label = paste0("$", revenue_per_trip, "/trip")), hjust = 1.1, colour = "white", size = 3.5) +
+  labs(title = "9. Highest-revenue routes", subtitle = "Total amount collected; labels show revenue per trip",
+       x = NULL, y = "Revenue (million USD)")
+save_plot(p, "09_top_revenue_routes", width = 12)
+
+# *Short Upper-East-Side hops are the most frequent routes, but the money is made on airport routes, which earn 4–6× more per trip.*
+
+pb <- pay_borough[pu_borough != "EWR"]
+p <- ggplot(pb, aes(pu_borough, share_pct, fill = payment_type)) + geom_col(position = "fill") +
+  scale_y_continuous(labels = percent) + scale_fill_brewer(palette = "Set2", name = "Payment type") +
+  labs(title = "10. Payment-type distribution by pickup borough", x = "Pickup borough", y = "Share of trips")
+save_plot(p, "10_payment_by_borough")
+
+# *Credit cards dominate everywhere, but cash and flex/unknown payments are more common outside Manhattan.*
+
+hex_samp <- trips[sample(.N, 5e5)][trip_distance <= 30 & fare_amount <= 150]
+p <- ggplot(hex_samp, aes(trip_distance, fare_amount)) +
+  geom_hex(bins = 70) + scale_fill_viridis_c(trans = "log10", name = "Trips (log scale)") +
+  geom_smooth(method = "lm", formula = y ~ x, colour = "red", linewidth = 1) +
+  labs(title = "11. Trip distance vs fare amount", subtitle = "500,000-trip random sample; red line = linear fit",
+       x = "Trip distance (miles)", y = "Fare amount (USD)")
+save_plot(p, "11_distance_vs_fare")
+
+# *Fare rises almost linearly with distance. The horizontal band at ≈ 70 USD is the JFK–Manhattan flat fare.*
+
+bp <- bench_all[comparison %in% c("A: row-level fare per mile", "B: grouped mean by borough x hour", "E: revenue by month x hour", "G: join 2M trips with zones")]
+p <- ggplot(bp, aes(reorder(approach, median_ms), median_ms, fill = grepl("data.table|vectorized|colMeans", approach))) +
+  geom_col(show.legend = FALSE) + coord_flip() + facet_wrap(~ comparison, scales = "free", ncol = 2) +
+  scale_y_log10(labels = comma) + scale_fill_manual(values = c(`FALSE` = "grey60", `TRUE` = "#27AE60")) +
+  labs(title = "12. Benchmark: execution time of different R approaches", subtitle = "Median of repeated runs, log scale (green = vectorized / data.table)",
+       x = NULL, y = "Median execution time (ms, log scale)")
+save_plot(p, "12_benchmark_comparison", width = 14, height = 8)
+
+p <- ggplot(scaling, aes(cores, speedup)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_line(colour = "#8E44AD", linewidth = 1.2) + geom_point(size = 3, colour = "#8E44AD") +
+  geom_text(aes(label = paste0(speedup, "x")), vjust = -1) +
+  scale_x_continuous(breaks = scaling$cores) + expand_limits(y = 0) +
+  labs(title = "13. Parallel speedup (bootstrap per month)", subtitle = "Dashed line = ideal linear speedup",
+       x = "Number of worker cores", y = "Speedup (sequential time / parallel time)")
+save_plot(p, "13_parallel_speedup", width = 9)
+
+p <- ggplot(scal, aes(rows, median_ms / 1000, colour = approach)) + geom_line(linewidth = 1.1) + geom_point(size = 2) +
+  scale_x_log10(labels = label_number(scale_cut = cut_short_scale())) + scale_y_log10() +
+  scale_colour_brewer(palette = "Set1", name = NULL) +
+  labs(title = "14. Scalability: grouped mean by pickup zone", x = "Number of rows (log scale)", y = "Execution time (seconds, log scale)")
+save_plot(p, "14_scalability")
+
+# *data.table is fastest for every size and the gap widens as the number of rows grows; parallel speedup is
+# real but sub-linear.*
+#
+# ### 8.1 Optional advanced task – geographical visualizations
+# Zone polygons from the official TLC shapefile are used for a static choropleth (ggplot2 + sf) and an
+# interactive **leaflet** map of the top pickup zones.
+
+suppressPackageStartupMessages({ library(sf); library(leaflet); library(htmlwidgets) })
+shape_dir <- file.path(DATA_DIR, "taxi_zones")
+if (!dir.exists(shape_dir)) unzip(shape_zip, exdir = shape_dir)
+shp <- list.files(shape_dir, pattern = "\\.shp$", recursive = TRUE, full.names = TRUE)[1]
+zones_sf <- st_transform(st_make_valid(st_read(shp, quiet = TRUE)), 4326)
+zone_stats <- trips[, .(pickups = .N, revenue = sum(total_amount), avg_total = mean(total_amount)), by = .(LocationID = PULocationID)]
+zones_sf <- merge(zones_sf, zone_stats, by = "LocationID", all.x = TRUE)
+
+p <- ggplot(zones_sf) + geom_sf(aes(fill = pickups), colour = "white", linewidth = 0.05) +
+  scale_fill_viridis_c(trans = "log10", labels = comma, name = "Pickups (log)", na.value = "grey90") +
+  labs(title = "15. Pickups by taxi zone, Jan-Jun 2024") + theme_void(base_size = 13) + theme(legend.position = "right")
+save_plot(p, "15_pickup_map", width = 9, height = 9)
+
+top_sf <- zones_sf[order(-zones_sf$revenue), ][1:25, ]
+cent <- suppressWarnings(st_coordinates(st_centroid(top_sf)))
+top_sf$lng <- cent[, 1]; top_sf$lat <- cent[, 2]
+pal <- colorNumeric("YlOrRd", domain = top_sf$avg_total)
+m <- leaflet(top_sf) |>
+  addProviderTiles(providers$CartoDB.Positron) |>
+  addPolygons(data = zones_sf, weight = 0.4, color = "grey", fillOpacity = 0.05) |>
+  addCircleMarkers(~lng, ~lat, radius = ~sqrt(pickups) / 60, color = ~pal(avg_total), fillOpacity = 0.8, stroke = FALSE,
+                   label = ~sprintf("%s (%s): %s pickups, $%s M revenue, $%.2f avg", zone, borough, comma(pickups), round(revenue / 1e6, 1), avg_total)) |>
+  addLegend("bottomright", pal = pal, values = ~avg_total, title = "Avg total (USD)")
+saveWidget(m, file.path(normalizePath(OUT_DIR), "leaflet_top_revenue_zones.html"), selfcontained = TRUE)
+m
+
+# *The busiest and highest-revenue zones are concentrated in Midtown/Lower Manhattan, while the two airports
+# (JFK, LaGuardia) stand out with the highest average amount per trip. Open
+# `outputs/leaflet_top_revenue_zones.html` for the interactive map.*
