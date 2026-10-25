@@ -972,3 +972,112 @@ m
 # *The busiest and highest-revenue zones are concentrated in Midtown/Lower Manhattan, while the two airports
 # (JFK, LaGuardia) stand out with the highest average amount per trip. Open
 # `outputs/leaflet_top_revenue_zones.html` for the interactive map.*
+
+# ---
+# ## 9. Observations
+# The key measured numbers from this run are collected below (they will vary slightly between machines).
+
+bm <- function(cmp, pattern) bench_all[comparison == cmp & grepl(pattern, approach, fixed = TRUE), median_ms][1]
+obs <- data.table(
+  metric = c("Trips analysed (after cleaning)", "Peak pickup hour", "Busiest weekday (avg trips/day)", "Busiest month (avg trips/day)",
+             "Top revenue route", "Credit-card share of trips (%)", "Distance-fare correlation",
+             "Row-level: apply() vs vectorized (x slower)", "Grouping 2M: lapply(split()) vs data.table (x slower)",
+             "Grouping 20M: aggregate() vs data.table (x slower)", "Join 2M: merge() vs data.table (x slower)",
+             sprintf("Parallel speedup with %d cores", N_CORES), "Light task: parallel vs sequential (speedup)"),
+  value = c(format(nrow(trips), big.mark = ","), paste0(hourly[which.max(trips), pickup_hour], ":00"),
+            as.character(dow[which.max(avg_trips_per_day), pickup_wday]), as.character(monthly[which.max(trips_per_day), month]),
+            top_rev_routes[1, paste(pu_zone, "->", do_zone)], pay_overall[payment_type == "Credit card", share_pct],
+            round(trips[, cor(trip_distance, fare_amount)], 3),
+            round(bm("A: row-level fare per mile", "apply()") / bm("A: row-level fare per mile", "vectorized")),
+            round(bm("B: grouped mean by borough x hour", "lapply(split())") / bm("B: grouped mean by borough x hour", "data.table")),
+            round(bm("E: revenue by month x hour", "aggregate()") / bm("E: revenue by month x hour", "data.table")),
+            round(bm("G: join 2M trips with zones", "merge()") / bm("G: join 2M trips with zones", "data.table join")),
+            paste0(speedup_main, "x"), paste0(light[2, speedup_vs_seq], "x")))
+obs
+
+# 1. **Demand** is strongly time dependent: an evening peak around 17–18 h, a minimum at 4–5 AM, the highest
+#    per-day demand on mid-week days and the lowest on Sundays, and a spring high after the winter months.
+# 2. **Revenue** is concentrated in the midday and evening-rush periods, while **airport routes** (JFK,
+#    LaGuardia) generate by far the highest revenue per trip and dominate the highest-revenue routes.
+# 3. **Fare vs distance** is strongly linear, but the fare per mile is highest for very short trips.
+# 4. **Payments:** credit cards account for roughly four out of five trips; cash is used relatively more in the outer
+#    boroughs, and tips are recorded almost only for card payments.
+# 5. **Performance:** data.table and vectorized operations were faster than functional row-wise code by orders of
+#    magnitude; data.table beat base R `aggregate()`/`merge()` by a large factor while using less memory;
+#    parallel processing gave a real but sub-linear speedup for the heavy bootstrap and was slower for the light task.
+
+# ---
+# ## 10. Task 7 – Critical Analysis and Recommendation
+#
+# **1. Which approach provides the best execution performance?**
+# **data.table** for data manipulation (filter, group, sort, join) and **vectorized** code for element-wise
+# arithmetic. In the benchmarks data.table was the fastest entry for filtering, grouping and sorting, many times
+# faster than base R `aggregate()` and `merge()`, and vectorized arithmetic was thousands of times faster than
+# row-wise `apply()`. The exceptions are instructive: a single-column `match()` lookup beat the data.table join,
+# and functional `lapply()` over a few columns matched data.table – iterating over a few large units costs nothing.
+#
+# **2. How does data.table improve the processing of large datasets?**
+# (a) Operations are implemented in optimised, **multi-threaded C** (radix sorting and grouping, GForce for
+# `mean`/`sum`); (b) `:=`, `set()`, `setkey()`, `setorder()` and update joins modify data **by reference**, so a
+# 20-million-row table is never copied – visible in the much lower peak memory of the update join;
+# (c) `fread()`/`setDT()` give fast import; (d) the concise `DT[i, j, by]` syntax combines filtering, computing and
+# grouping in one optimised step.
+#
+# **3. When is functional programming preferable?**
+# When iterating over a **small number of large items** – columns, files, months, model specifications, groups –
+# where the per-call overhead is negligible (Experiment C showed `lapply()`/`map_dbl()` as fast as `colMeans()`),
+# and when clarity and composability matter (purrr's type-stable `map_dbl()`, pipelines, applying the same
+# function to every partition). It is also the natural interface to parallelism (`foreach`, `parLapply`).
+# It should not be used to loop over millions of rows.
+#
+# **4. When do vectorized operations provide better performance?**
+# Whenever the same operation is applied to every element of a vector/column (arithmetic, comparisons,
+# `ifelse`, `pmin`, cumulative functions): one call into compiled code replaces millions of interpreted R calls,
+# giving the 1000×-scale gains measured in Experiment A.
+#
+# **5. What performance improvement was obtained using parallel computing?**
+# For the CPU-intensive month-wise bootstrap the measured speedup is shown in the scaling table (Section 6.5)
+# and the observations table – a clear gain that increases with the number of cores but stays below the ideal
+# (efficiency below 100 %).
+#
+# **6. Does parallel computing always result in faster execution?**
+# **No.** The lightweight task (mean fare per month) was *slower* in parallel than sequentially, because
+# starting workers and serialising ≈ 600 MB of partitions costs much more than the computation. Even for the
+# heavy task, overheads (data transfer, uneven number of partitions per worker, memory bandwidth) prevent linear
+# speedup. A single multi-threaded data.table grouping was faster than both partitioned versions for the light
+# task. Parallelism helps only when the computation per partition is large relative to the communication cost.
+#
+# **7. Trade-offs between speed, memory, readability and scalability**
+#
+# | Approach | Speed | Memory | Readability | Scalability |
+# |---|---|---|---|---|
+# | `apply()` / `lapply()` / `map()` per row | very slow | high (per-call allocation, matrix copy) | good | poor |
+# | `for` loop (pre-allocated) | very slow | low | good for beginners, verbose | poor |
+# | Vectorized base R | very fast | moderate (temporary vectors) | very good | good |
+# | Base R `aggregate()` / `merge()` | slow | high (copies) | good | moderate |
+# | data.table | fastest | lowest (by reference) | good once learnt, terse syntax | excellent |
+# | foreach + doParallel | faster only for heavy tasks | high (data copied to every worker) | more complex code | good for CPU-bound, independent tasks |
+#
+# **8. Recommendation for large-scale analytical applications**
+# Use **data.table as the core engine** (import with arrow/fread, clean, join and aggregate by reference),
+# write element-wise logic in **vectorized** form, use **functional programming** (`lapply`/`purrr::map`) for
+# iterating over files, columns or partitions, and add **foreach + doParallel** only for genuinely CPU-intensive,
+# independent tasks such as bootstrapping, simulation or model fitting per partition – after checking with a
+# benchmark that the speedup outweighs the overhead. This recommendation is directly supported by the
+# benchmark and speedup tables obtained in this notebook.
+
+# ---
+# ## 11. Conclusion
+#
+# An end-to-end, reproducible big-data workflow was built in R for ≈ 20 million NYC Yellow Taxi trips
+# (January–June 2024). data.table made it possible to import, clean, enrich, join and aggregate the full dataset in
+# seconds on a laptop with modest memory, by working in place. The analysis showed clear temporal demand
+# patterns, the dominance of credit-card payments and the outsized revenue of airport routes. The benchmarks
+# demonstrated that **how** R code is written matters more than the hardware: row-wise functional code was
+# thousands of times slower than vectorized code, base R grouping and joining were many times slower and more
+# memory hungry than data.table, and parallel computing with foreach/doParallel delivered a useful but
+# sub-linear speedup only for compute-heavy work. The recommended architecture is therefore data.table +
+# vectorization at the core, functional programming for iteration over a few large units, and parallelism only
+# where benchmarks prove it worthwhile.
+
+sessionInfo()
