@@ -328,3 +328,136 @@ cat(sprintf("\nFinal dataset: %s trips (%.1f %% of raw records kept), %s in memo
 # 95 % of the raw records remain, so the cleaning removes noise without biasing the dataset. Converting codes to
 # factors and dropping unused columns reduces the memory footprint, and every expensive step (feature creation,
 # imputation, joins) was done **by reference** with data.table, which avoids copying a multi-gigabyte table.
+
+# ---
+# ## 4. Task 2 – Transportation Data Analytics
+# All aggregations use data.table's `DT[i, j, by]` syntax.
+#
+# ### 4.1 Number of taxi trips by hour of day
+
+hourly <- trips[, .(trips = .N, avg_fare = mean(fare_amount), avg_total = mean(total_amount)), by = pickup_hour][order(pickup_hour)]
+hourly[, share_pct := round(100 * trips / sum(trips), 2)]
+hourly
+cat("Peak hour:", hourly[which.max(trips), pickup_hour], ":00 with", format(max(hourly$trips), big.mark = ","), "trips\n")
+cat("Quietest hour:", hourly[which.min(trips), pickup_hour], ":00 with", format(min(hourly$trips), big.mark = ","), "trips\n")
+
+# ### 4.2 Taxi demand across days of the week
+# Because a six-month period does not contain the same number of Mondays, Tuesdays … , demand is also
+# normalised as **average trips per day**.
+
+dow <- trips[, .(trips = .N, days = uniqueN(pickup_date), avg_fare = round(mean(fare_amount), 2),
+                 avg_distance = round(mean(trip_distance), 2)), by = pickup_wday][order(pickup_wday)]
+dow[, avg_trips_per_day := round(trips / days)]
+dow
+dow_hour <- trips[, .N, by = .(is_weekend, pickup_hour)]
+dow_hour[, days := ifelse(is_weekend, trips[is_weekend == TRUE, uniqueN(pickup_date)], trips[is_weekend == FALSE, uniqueN(pickup_date)])]
+dow_hour[, trips_per_day := N / days]
+dcast(dow_hour, pickup_hour ~ ifelse(is_weekend, "weekend", "weekday"), value.var = "trips_per_day")[, lapply(.SD, round)]
+
+# ### 4.3 Monthly variation in taxi usage
+
+monthly <- trips[, .(trips = .N, days = uniqueN(pickup_date), revenue_musd = round(sum(total_amount) / 1e6, 2),
+                     avg_fare = round(mean(fare_amount), 2), avg_distance = round(mean(trip_distance), 2),
+                     avg_duration_min = round(mean(trip_duration_min), 1)), by = month][order(month)]
+monthly[, trips_per_day := round(trips / days)]
+monthly[, change_vs_prev_pct := round(100 * (trips_per_day / shift(trips_per_day) - 1), 1)]
+monthly
+
+# ### 4.4 Average fare and total revenue for different time periods
+
+period_stats <- trips[, .(trips = .N, avg_fare = round(mean(fare_amount), 2), avg_total = round(mean(total_amount), 2),
+                          avg_distance = round(mean(trip_distance), 2), revenue_musd = round(sum(total_amount) / 1e6, 2)),
+                      by = time_period][order(time_period)]
+period_stats[, revenue_share_pct := round(100 * revenue_musd / sum(revenue_musd), 1)]
+period_stats
+trips[, .(trips = .N, avg_fare = round(mean(fare_amount), 2), avg_total = round(mean(total_amount), 2),
+          revenue_musd = round(sum(total_amount) / 1e6, 2)), by = .(day_type = ifelse(is_weekend, "Weekend", "Weekday"))]
+
+# ### 4.5 Most frequently travelled pickup – drop-off routes
+
+routes <- trips[, .(trips = .N, avg_fare = mean(fare_amount), avg_distance = mean(trip_distance),
+                    revenue = sum(total_amount)), by = .(pu_zone, do_zone)]
+top_routes <- routes[order(-trips)][1:15]
+top_routes[, `:=`(avg_fare = round(avg_fare, 2), avg_distance = round(avg_distance, 2), revenue_kusd = round(revenue / 1e3))][, revenue := NULL]
+top_routes
+cat("Distinct routes observed:", format(nrow(routes), big.mark = ","), "\n")
+cat("Share of trips starting and ending in the same zone:",
+    round(100 * trips[PULocationID == DOLocationID, .N] / nrow(trips), 2), "%\n")
+
+# ### 4.6 Highest-revenue routes (total amount collected)
+
+top_rev_routes <- routes[order(-revenue)][1:15]
+top_rev_routes[, `:=`(revenue_musd = round(revenue / 1e6, 2), avg_fare = round(avg_fare, 2),
+                      avg_distance = round(avg_distance, 1), revenue_per_trip = round(revenue / trips, 2))][, revenue := NULL]
+top_rev_routes
+airport_zones <- c("JFK Airport", "LaGuardia Airport", "Newark Airport")
+trips[, .(trips = .N, revenue_musd = round(sum(total_amount) / 1e6, 1)),
+      by = .(airport_trip = pu_zone %in% airport_zones | do_zone %in% airport_zones)][
+      , `:=`(trip_share_pct = round(100 * trips / sum(trips), 1), revenue_share_pct = round(100 * revenue_musd / sum(revenue_musd), 1))][]
+
+# ### 4.7 Relationship between trip distance and fare amount
+
+cat("Pearson correlation (distance, fare)  :", round(trips[, cor(trip_distance, fare_amount)], 3), "\n")
+samp_cor <- trips[sample(.N, 1e6)]
+cat("Spearman correlation (1M-row sample)   :", round(samp_cor[, cor(trip_distance, fare_amount, method = "spearman")], 3), "\n")
+
+fit <- lm(fare_amount ~ trip_distance, data = trips[RatecodeID == "Standard"])
+cat(sprintf("Linear model (standard rate): fare = %.2f + %.2f x miles, R^2 = %.3f\n",
+            coef(fit)[1], coef(fit)[2], summary(fit)$r.squared))
+
+dist_bands <- trips[, .(trips = .N, avg_fare = round(mean(fare_amount), 2), median_fare = median(fare_amount),
+                        fare_per_mile = round(mean(fare_amount / trip_distance), 2),
+                        avg_duration_min = round(mean(trip_duration_min), 1)),
+                    by = .(distance_band = cut(trip_distance, c(0, 1, 2, 3, 5, 10, 20, 100),
+                                               labels = c("0-1", "1-2", "2-3", "3-5", "5-10", "10-20", "20+")))][order(distance_band)]
+dist_bands
+
+# ### 4.8 Payment methods across boroughs
+
+pay_overall <- trips[, .(trips = .N, avg_total = round(mean(total_amount), 2)), by = payment_type][order(-trips)]
+pay_overall[, share_pct := round(100 * trips / sum(trips), 2)]
+pay_overall
+pay_borough <- trips[!pu_borough %in% c("Unknown", "N/A"), .N, by = .(pu_borough, payment_type)]
+pay_borough[, share_pct := round(100 * N / sum(N), 1), by = pu_borough]
+dcast(pay_borough[payment_type %in% c("Credit card", "Cash", "Flex/Unknown")], pu_borough ~ payment_type, value.var = "share_pct", fill = 0)
+
+# ### 4.9 Additional patterns
+
+# (a) tipping behaviour by payment type (cash tips are not recorded by the meter)
+trips[payment_type %in% c("Credit card", "Cash"),
+      .(avg_tip = round(mean(tip_amount), 2), tip_pct_of_fare = round(100 * mean(tip_amount / fare_amount), 1),
+        zero_tip_pct = round(100 * mean(tip_amount == 0), 1)), by = payment_type]
+
+# (b) average speed by hour - congestion pattern
+speed_hour <- trips[trip_duration_min >= 1, .(avg_speed_mph = round(mean(trip_distance / (trip_duration_min / 60)), 1)), by = pickup_hour][order(pickup_hour)]
+cat("Slowest hour:", speed_hour[which.min(avg_speed_mph), pickup_hour], ":00 (", min(speed_hour$avg_speed_mph), "mph ) | fastest hour:",
+    speed_hour[which.max(avg_speed_mph), pickup_hour], ":00 (", max(speed_hour$avg_speed_mph), "mph )\n")
+
+# (c) passenger count distribution
+trips[, .(trips = .N), by = .(passengers = pmin(passenger_count, 5L))][order(passengers)][, share_pct := round(100 * trips / sum(trips), 1)][]
+
+# (d) days with the highest and lowest demand
+daily <- trips[, .(trips = .N, revenue = sum(total_amount)), by = pickup_date][order(pickup_date)]
+rbind(daily[order(-trips)][1:3][, type := "busiest"], daily[order(trips)][1:3][, type := "quietest"])
+
+# **Interpretation of Task 2**
+#
+# * **Hourly demand** follows a clear commuter/leisure cycle: demand is lowest around 4–5 AM, builds through
+#   the morning and peaks in the late afternoon / early evening (≈ 17–18 h). Average fares are highest in the
+#   early morning because those trips are longer (airport and outer-borough runs).
+# * **Day of week:** weekdays (especially Wed–Thu) have the highest average trips per day, Sunday the lowest.
+#   The weekday/weekend hourly profile shows weekend demand shifted to late night (0–3 h).
+# * **Monthly:** demand rises from January to spring (March–May are the busiest), reflecting winter
+#   seasonality and tourism; June stays high.
+# * **Revenue by period:** the midday and evening-rush periods generate most of the revenue, while early-morning
+#   trips have the highest revenue per trip.
+# * **Routes:** the most frequent routes are short trips inside Manhattan's Upper East Side; the
+#   **highest-revenue routes all involve JFK / LaGuardia airports** – airport trips are a small share of trips
+#   but a much larger share of revenue.
+# * **Distance vs fare:** a strong positive, almost linear relationship (fare ≈ base + ≈ 4–5 USD per mile under the
+#   standard rate) with high R², but the **fare per mile falls** sharply with distance because of the fixed
+#   base charge and time-based charges on short congested trips.
+# * **Payment:** credit cards dominate (≈ 80 % of trips); cash is relatively more common in the outer
+#   boroughs. Recorded tips are almost exclusively on card payments.
+# * **Other patterns:** taxis are slowest in the afternoon (congestion) and fastest early in the morning;
+#   most trips carry a single passenger; holidays and storms produce the quietest days.
