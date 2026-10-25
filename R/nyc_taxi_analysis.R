@@ -145,3 +145,186 @@ if (!file.exists(shape_zip)) download.file(paste0(base_url, "/misc/taxi_zones.zi
 
 data.table(file = basename(c(trip_files, zone_file, shape_zip)),
            size_MB = round(file.size(c(trip_files, zone_file, shape_zip)) / 2^20, 1))
+
+# ---
+# ## 3. Task 1 – Data Acquisition and Preparation
+#
+# ### 3.1 Import the trip records
+# `arrow::open_dataset()` treats the six Parquet files as one dataset; `as.data.frame()` reads it in a single pass
+# and `setDT()` converts the result to a `data.table` **by reference** (no extra copy).
+
+t_import <- system.time({
+  trips <- setDT(as.data.frame(open_dataset(trip_files, unify_schemas = TRUE)))
+})
+cat(sprintf("Imported %s rows x %d columns in %.1f s\n",
+            format(nrow(trips), big.mark = ","), ncol(trips), t_import[["elapsed"]]))
+raw_size <- object.size(trips)
+cat("Memory used by raw table:", format(raw_size, units = "auto"), "\n")
+
+# ### 3.2 Inspect structure, dimensions, data types and summary statistics
+
+dim(trips)
+str(trips)
+
+num_cols <- names(trips)[vapply(trips, is.numeric, logical(1))]
+stats <- rbindlist(lapply(num_cols, function(cn) {
+  x <- trips[[cn]]
+  data.table(column = cn, min = min(x, na.rm = TRUE), mean = mean(x, na.rm = TRUE),
+             median = median(x, na.rm = TRUE), max = max(x, na.rm = TRUE), missing = sum(is.na(x)))
+}))
+stats[, (2:5) := lapply(.SD, round, 2), .SDcols = 2:5]
+stats
+cat("Pickup time range:", format(range(trips$tpep_pickup_datetime)), "\n")
+
+# ### 3.3 Missing, duplicate, inconsistent and invalid records
+# First we count missing values per column.
+
+na_counts <- trips[, lapply(.SD, function(x) sum(is.na(x)))]
+na_counts <- melt(na_counts, measure.vars = names(na_counts), variable.name = "column", value.name = "missing")
+na_counts[, pct := round(100 * missing / nrow(trips), 2)]
+na_counts[missing > 0]
+# Rows with missing passenger_count also miss RatecodeID / store_and_fwd_flag and have payment_type 0
+trips[is.na(passenger_count), .N, by = payment_type]
+
+# **Cleaning rules** (each step is logged):
+#
+# | Problem | Rule | Action |
+# |---|---|---|
+# | Duplicates | identical vendor, timestamps, locations, distance and amount | remove |
+# | Out-of-period records | pickup outside 1 Jan – 30 Jun 2024 (wrong meter clocks) | remove |
+# | Missing `passenger_count` / `RatecodeID` | ≈ 10 % of rows (flex-fare / app trips) | **impute** passenger count with the median (1), RatecodeID with 99 = unknown |
+# | Zero passengers | inconsistent with a paid trip | impute with median (1) |
+# | Non-positive or extreme amounts | fare ≤ 0 or > 500 USD, total ≤ 0, negative tip/tolls | remove (refunds, voids, typos) |
+# | Invalid distance | distance ≤ 0 or > 100 miles | remove |
+# | Invalid duration | drop-off not after pickup or trip longer than 3 hours | remove |
+# | Impossible speed | average speed > 80 mph | remove |
+# | Invalid zone IDs | outside 1–265 | remove |
+
+clean_log <- data.table(step = "Raw records", rows = nrow(trips))
+log_step  <- function(step) clean_log <<- rbind(clean_log, data.table(step = step, rows = nrow(trips)))
+
+# 1. exact duplicates (on the identifying columns)
+trips <- unique(trips, by = c("VendorID", "tpep_pickup_datetime", "tpep_dropoff_datetime",
+                              "PULocationID", "DOLocationID", "trip_distance", "total_amount"))
+log_step("Remove duplicate trips")
+
+# 2. pickups outside the analysis period
+period_start <- as.POSIXct("2024-01-01 00:00:00", tz = "UTC")
+period_end   <- as.POSIXct("2024-07-01 00:00:00", tz = "UTC")
+trips <- trips[tpep_pickup_datetime >= period_start & tpep_pickup_datetime < period_end]
+log_step("Remove pickups outside Jan-Jun 2024")
+
+# 3. impute missing / zero passenger count and missing rate code (update by reference)
+n_pass_fixed <- trips[is.na(passenger_count) | passenger_count == 0, .N]
+trips[is.na(passenger_count) | passenger_count == 0, passenger_count := 1L]
+trips[is.na(RatecodeID), RatecodeID := 99L]
+cat("Passenger count imputed for", format(n_pass_fixed, big.mark = ","), "rows\n")
+
+# 4. invalid amounts
+trips <- trips[fare_amount > 0 & fare_amount <= 500 & total_amount > 0 & tip_amount >= 0 & tolls_amount >= 0]
+log_step("Remove invalid fare / total / tip / tolls")
+
+# 5. invalid distance
+trips <- trips[trip_distance > 0 & trip_distance <= 100]
+log_step("Remove invalid trip distance")
+
+# 6. invalid duration (computed by reference, vectorized)
+trips[, trip_duration_min := as.numeric(tpep_dropoff_datetime - tpep_pickup_datetime, units = "mins")]
+trips <- trips[trip_duration_min > 0 & trip_duration_min <= 180]
+log_step("Remove invalid trip duration")
+
+# 7. impossible speed
+trips <- trips[trip_distance / (trip_duration_min / 60) <= 80]
+log_step("Remove speed > 80 mph")
+
+# 8. invalid zone IDs
+trips <- trips[PULocationID %between% c(1L, 265L) & DOLocationID %between% c(1L, 265L)]
+log_step("Remove invalid zone IDs")
+
+clean_log[, removed := shift(rows, fill = rows[1]) - rows]
+clean_log[, pct_of_raw := round(100 * rows / rows[1], 2)]
+clean_log
+
+# ### 3.4 Convert attributes into appropriate data types
+# Integer codes become labelled **factors** (stored as integers + labels – memory efficient and readable).
+
+payment_labels <- c("0" = "Flex/Unknown", "1" = "Credit card", "2" = "Cash",
+                    "3" = "No charge", "4" = "Dispute", "5" = "Unknown", "6" = "Voided")
+rate_labels <- c("1" = "Standard", "2" = "JFK", "3" = "Newark", "4" = "Nassau/Westchester",
+                 "5" = "Negotiated", "6" = "Group ride", "99" = "Unknown")
+
+trips[, payment_type := factor(payment_labels[as.character(payment_type)],
+                               levels = c("Credit card", "Cash", "Flex/Unknown", "Dispute", "No charge", "Unknown", "Voided"))]
+trips[, RatecodeID := factor(rate_labels[as.character(RatecodeID)], levels = unique(rate_labels))]
+trips[, passenger_count := as.integer(passenger_count)]
+trips[, `:=`(PULocationID = as.integer(PULocationID), DOLocationID = as.integer(DOLocationID))]
+sapply(trips[, .(payment_type, RatecodeID, passenger_count, PULocationID, trip_distance)], class)
+
+# ### 3.5 Extract temporal attributes
+# Hour, day of month, day of week (Monday first), month, date and a weekend flag. data.table's
+# `hour()`, `mday()`, `wday()` and `month()` are fast vectorized C implementations.
+
+wday_labels <- c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+t_time <- system.time({
+  trips[, `:=`(
+    pickup_date  = as.IDate(tpep_pickup_datetime),
+    pickup_hour  = hour(tpep_pickup_datetime),
+    pickup_day   = mday(tpep_pickup_datetime),
+    pickup_wday  = factor((wday(tpep_pickup_datetime) + 5L) %% 7L + 1L, levels = 1:7, labels = wday_labels),
+    month        = factor(month(tpep_pickup_datetime), levels = 1:6, labels = month.abb[1:6])
+  )]
+  trips[, is_weekend := pickup_wday %in% c("Sat", "Sun")]
+  trips[, time_period := cut(pickup_hour, breaks = c(-1, 5, 9, 15, 19, 23),
+                             labels = c("Early morning (0-5)", "Morning rush (6-9)", "Midday (10-15)",
+                                        "Evening rush (16-19)", "Night (20-23)"))]
+})
+cat("Temporal features created in", t_time[["elapsed"]], "s\n")
+head(trips[, .(tpep_pickup_datetime, pickup_date, pickup_hour, pickup_day, pickup_wday, month, is_weekend, time_period)])
+
+# ### 3.6 Remove unnecessary attributes to reduce memory
+# Surcharges and technical flags are not needed for the analysis. Columns are dropped **by reference**
+# (`:= NULL`), which does not copy the table.
+
+size_before <- object.size(trips)
+drop_cols <- intersect(c("VendorID", "store_and_fwd_flag", "extra", "mta_tax", "improvement_surcharge",
+                         "congestion_surcharge", "Airport_fee", "airport_fee"), names(trips))
+trips[, (drop_cols) := NULL]
+size_after <- object.size(trips)
+invisible(gc())
+data.table(stage = c("Raw import", "After cleaning + new features", "After dropping columns"),
+           columns = c(19, ncol(trips) + length(drop_cols), ncol(trips)),
+           size = c(format(raw_size, units = "MB"), format(size_before, units = "MB"), format(size_after, units = "MB")))
+
+# ### 3.7 Import the Taxi Zone Lookup Table
+
+zones <- fread(zone_file)
+setkey(zones, LocationID)
+cat("Zones:", nrow(zones), "\n")
+zones[, .N, by = Borough][order(-N)]
+head(zones)
+
+# ### 3.8 Join trips with zone information
+# An **update join** (`X[Y, on = , := ]`) adds pickup and drop-off borough/zone to the 20 million rows
+# by reference – no copy of the large table is created (a `merge()` would copy it twice).
+
+t_join <- system.time({
+  trips[zones, on = .(PULocationID = LocationID), `:=`(pu_borough = i.Borough, pu_zone = i.Zone)]
+  trips[zones, on = .(DOLocationID = LocationID), `:=`(do_borough = i.Borough, do_zone = i.Zone)]
+  # repeated strings -> factors to save memory
+  for (col in c("pu_borough", "pu_zone", "do_borough", "do_zone")) set(trips, j = col, value = factor(trips[[col]]))
+})
+cat("Two update joins on", format(nrow(trips), big.mark = ","), "rows took", t_join[["elapsed"]], "s\n")
+setkey(trips, tpep_pickup_datetime)
+trips[, .(trips = .N), by = pu_borough][order(-trips)]
+
+# ### 3.9 Final prepared dataset
+
+str(trips)
+cat(sprintf("\nFinal dataset: %s trips (%.1f %% of raw records kept), %s in memory\n",
+            format(nrow(trips), big.mark = ","), 100 * nrow(trips) / clean_log$rows[1],
+            format(object.size(trips), units = "auto")))
+
+# **Interpretation:** after removing duplicates, out-of-period, invalid and implausible records about
+# 95 % of the raw records remain, so the cleaning removes noise without biasing the dataset. Converting codes to
+# factors and dropping unused columns reduces the memory footprint, and every expensive step (feature creation,
+# imputation, joins) was done **by reference** with data.table, which avoids copying a multi-gigabyte table.
