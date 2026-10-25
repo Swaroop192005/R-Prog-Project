@@ -1,0 +1,4 @@
+cores,parallel_s,sequential_s,speedup,efficiency_pct
+1,45.822,42.752,0.93,93
+2,26.139,42.752,1.64,82
+3,18.575,42.752,2.3,77
