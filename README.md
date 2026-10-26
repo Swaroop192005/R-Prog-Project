@@ -20,7 +20,7 @@ data.table** programming, **sequential vs parallel** processing with `foreach` +
 | `outputs/figures/` | All figures (PNG) |
 | `outputs/benchmark_results.csv` | Execution-time comparison table |
 | `outputs/parallel_scaling.csv` | Parallel speedup per number of cores |
-| `outputs/leaflet_top_revenue_zones.html` | Interactive leaflet map |
+| `outputs/leaflet_revenue_by_zone.html` | Interactive leaflet map |
 
 Notebook structure: Problem Statement → Dataset → Data Preparation (Task 1) → Analytics (Task 2) →
 Functional/Vectorized/data.table (Task 3) → Parallel Computing (Task 4) → Benchmarking (Task 5) →
@@ -35,6 +35,19 @@ The raw data (about 340 MB of Parquet files) is **not stored in the repository**
 `data/` the first time it runs.
 
 ## How to run
+
+### Option A – Google Colab (nothing to install)
+
+1. Download `NYC_Taxi_BigData_Analytics.ipynb` from this repository.
+2. In Colab choose **File → Upload notebook**.
+3. Choose **Runtime → Change runtime type → R**.
+4. Choose **Runtime → Run all**, then **File → Print → Save as PDF** when it finishes.
+
+The notebook detects Colab and adapts to it: it analyses **three months instead of six** (a Colab session has
+about 12 GB of RAM, six months need about 11 GB at peak), installs the system libraries that `sf` needs, and
+uses at least two worker cores because a Colab session has only two. It downloads the taxi data itself.
+
+### Option B – locally with Jupyter
 
 1. Install **R ≥ 4.2** and **Jupyter**, then register the R kernel:
    ```r
@@ -59,7 +72,7 @@ The raw data (about 340 MB of Parquet files) is **not stored in the repository**
    `jupyter nbconvert --to webpdf NYC_Taxi_BigData_Analytics.ipynb`.
 
 **Memory:** all six months need about 10–12 GB of RAM. On an 8 GB machine, set
-`MONTHS <- sprintf("2024-%02d", 1:3)` in the setup cell. A full run takes about 12 minutes on 4 cores.
+`MONTHS <- sprintf("2024-%02d", 1:3)` in the setup cell. A full run takes about 18 minutes on 4 cores.
 Benchmark times and parallel speedups depend on the machine, so your numbers will differ slightly.
 
 ## Key results (reference run, 4-core machine)
@@ -71,10 +84,10 @@ Benchmark times and parallel speedups depend on the machine, so your numbers wil
 | Revenue | airport trips ≈ 10 % of trips but ≈ 27 % of revenue; top route JFK Airport → Outside of NYC |
 | Distance vs fare | correlation 0.936; standard rate ≈ 6 USD + 3.9 USD per mile |
 | Payments | credit card 76.2 %, cash ≈ 13.5 % |
-| Row-level: apply() vs vectorized | 1.3 s vs 0.4 ms (2951× slower) |
-| Grouping 20M rows: aggregate() vs data.table | 14.6 s vs 485.4 ms (30×) |
-| Join 2M rows: merge() vs data.table | 3.1 s vs 132.7 ms (23×) |
-| Bootstrap per month: sequential vs parallel (3 cores) | 42.8 s vs 19.4 s (2.2× speedup) |
+| Row-level: apply() vs vectorized | 1.6 s vs 0.5 ms (3382× slower) |
+| Grouping 20M rows: aggregate() vs data.table | 15.1 s vs 386.5 ms (39×) |
+| Join 2M rows: merge() vs data.table | 4.9 s vs 164.8 ms (30×) |
+| Bootstrap per month: sequential vs parallel (3 cores) | 54.8 s vs 25.9 s (2.11× speedup) |
 | Light task in parallel | 0.03× – slower than sequential because of data-transfer overhead |
 
 ## Recommendation

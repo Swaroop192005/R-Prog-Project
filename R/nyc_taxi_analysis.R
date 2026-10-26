@@ -69,17 +69,44 @@
 # ### 2.1 Environment setup
 # Install (if needed) and load the packages. `TZ = "UTC"` is set so that the timestamps, which the TLC stores
 # as New York local time without a time zone, are kept exactly as recorded.
+#
+# The notebook runs on a local machine and on **Google Colab with an R runtime**
+# (Runtime → Change runtime type → R). On Colab it automatically:
+#
+# * analyses **three months instead of six**, because a Colab session has about 12 GB of RAM while six months
+#   need roughly 11 GB at peak — edit `MONTHS` below to change this;
+# * installs the system libraries that the `sf` mapping package needs;
+# * uses **at least two worker cores**, since a Colab session has only two.
+#
+# The optional map section (`sf` + `leaflet`) is skipped automatically if those packages cannot be installed,
+# so the rest of the notebook always runs.
 
-required <- c("data.table", "arrow", "ggplot2", "foreach", "doParallel", "microbenchmark",
-              "purrr", "lubridate", "scales", "hexbin", "leaflet", "htmlwidgets", "sf")
-missing_pkgs <- required[!vapply(required, requireNamespace, logical(1), quietly = TRUE)]
-if (length(missing_pkgs) > 0) install.packages(missing_pkgs, repos = "https://cloud.r-project.org")
+ON_COLAB <- dir.exists("/content")                       # Google Colab R runtime
+CRAN     <- "https://cloud.r-project.org"
+have     <- function(p) requireNamespace(p, quietly = TRUE)
+need     <- function(pkgs) { p <- pkgs[!vapply(pkgs, have, logical(1))]
+                             if (length(p)) install.packages(p, repos = CRAN, quiet = TRUE) }
+
+# 1. core packages used by every section
+need(c("data.table", "ggplot2", "foreach", "doParallel", "microbenchmark",
+       "purrr", "lubridate", "scales", "hexbin"))
+
+# 2. a Parquet reader: arrow preferred, nanoparquet as a lightweight fallback
+need("arrow")
+if (!have("arrow")) need("nanoparquet")
+HAVE_ARROW <- have("arrow")
+stopifnot("need either arrow or nanoparquet to read Parquet files" = HAVE_ARROW || have("nanoparquet"))
+
+# 3. optional mapping packages (advanced task in Task 6); sf needs system libraries on Colab
+if (ON_COLAB && !have("sf")) system("apt-get install -y -qq libgdal-dev libgeos-dev libproj-dev libudunits2-dev")
+try(need(c("sf", "leaflet", "htmlwidgets")), silent = TRUE)
+HAVE_MAPS <- all(vapply(c("sf", "leaflet", "htmlwidgets"), have, logical(1)))
 
 Sys.setenv(TZ = "UTC")
 Sys.setenv(ARROW_DEFAULT_MEMORY_POOL = "system")   # let arrow return memory to the OS after import
 suppressPackageStartupMessages({
   library(data.table)
-  library(arrow)
+  if (HAVE_ARROW) library(arrow)
   library(ggplot2)
   library(foreach)
   library(doParallel)
@@ -92,16 +119,21 @@ suppressPackageStartupMessages({
 set.seed(2024)
 options(repr.plot.width = 12, repr.plot.height = 6, scipen = 999, width = 140)
 
-MONTHS   <- sprintf("2024-%02d", 1:6)        # analysis period: Jan - Jun 2024
-DATA_DIR <- "data"
-OUT_DIR  <- "outputs"
+MONTHS   <- if (ON_COLAB) sprintf("2024-%02d", 1:3) else sprintf("2024-%02d", 1:6)
+DATA_DIR <- if (ON_COLAB) "/content/data" else "data"
+OUT_DIR  <- if (ON_COLAB) "/content/outputs" else "outputs"
 FIG_DIR  <- file.path(OUT_DIR, "figures")
 for (d in c(DATA_DIR, FIG_DIR)) dir.create(d, showWarnings = FALSE, recursive = TRUE)
 
-N_CORES <- max(1L, parallel::detectCores() - 1L)   # keep one core free for the OS
+# keep one core free for the OS, but always use at least two workers so that the
+# sequential-vs-parallel comparison is meaningful on a 2-core machine such as Colab
+N_CORES <- max(2L, parallel::detectCores() - 1L)
 
 cat("R version          :", R.version.string, "\n")
 cat("data.table version :", as.character(packageVersion("data.table")), "\n")
+cat("Running on Colab   :", ON_COLAB, "| months analysed:", length(MONTHS), "\n")
+cat("Parquet reader     :", if (HAVE_ARROW) "arrow" else "nanoparquet",
+    "| mapping packages available:", HAVE_MAPS, "\n")
 cat("Logical cores      :", parallel::detectCores(), "| cores used for parallel work:", N_CORES, "\n")
 cat("data.table threads :", getDTthreads(), "\n")
 
@@ -151,11 +183,18 @@ data.table(file = basename(c(trip_files, zone_file, shape_zip)),
 # ## 3. Task 1 – Data Acquisition and Preparation
 #
 # ### 3.1 Import the trip records
-# `arrow::open_dataset()` treats the six Parquet files as one dataset; `as.data.frame()` reads it in a single pass
-# and `setDT()` converts the result to a `data.table` **by reference** (no extra copy).
+# Each monthly Parquet file is read with `arrow` (or `nanoparquet` when arrow is unavailable) and the monthly
+# tables are stacked with `data.table::rbindlist()`. Iterating over **files** with `lapply()` is a good use of
+# functional programming: the loop body runs only a handful of times, so the per-call overhead is irrelevant —
+# unlike looping over 20 million rows, which Task 3 measures.
 
+read_trip_file <- function(f) {
+  if (HAVE_ARROW) as.data.frame(arrow::read_parquet(f)) else as.data.frame(nanoparquet::read_parquet(f))
+}
 t_import <- system.time({
-  trips <- setDT(as.data.frame(open_dataset(trip_files, unify_schemas = TRUE)))
+  monthly_tables <- lapply(trip_files, read_trip_file)   # functional iteration over the monthly files
+  trips <- rbindlist(monthly_tables, fill = TRUE)        # data.table: stack them into one table
+  rm(monthly_tables); invisible(gc())
 })
 cat(sprintf("Imported %s rows x %d columns in %.1f s\n",
             format(nrow(trips), big.mark = ","), ncol(trips), t_import[["elapsed"]]))
@@ -957,6 +996,9 @@ save_plot(p, "14_scalability")
 # Zone polygons from the official TLC shapefile are used for a static choropleth (ggplot2 + sf) and an
 # interactive **leaflet** map of the top pickup zones.
 
+if (!HAVE_MAPS) {
+  message("sf / leaflet are not available - skipping the optional map section.")
+} else {
 suppressPackageStartupMessages({ library(sf); library(leaflet); library(htmlwidgets) })
 shape_dir <- file.path(DATA_DIR, "taxi_zones")
 if (!dir.exists(shape_dir)) unzip(shape_zip, exdir = shape_dir)
@@ -967,25 +1009,36 @@ zones_sf <- merge(zones_sf, zone_stats, by = "LocationID", all.x = TRUE)
 
 p <- ggplot(zones_sf) + geom_sf(aes(fill = pickups), colour = "white", linewidth = 0.05) +
   scale_fill_viridis_c(trans = "log10", labels = comma, name = "Pickups (log)", na.value = "grey90") +
-  labs(title = "15. Pickups by taxi zone, Jan-Jun 2024") + theme_void(base_size = 13) + theme(legend.position = "right", plot.title = element_text(face = "bold"))
+  labs(title = "15. Pickups by taxi zone") +
+  theme_void(base_size = 13) + theme(legend.position = "right", plot.title = element_text(face = "bold"))
 save_plot(p, "15_pickup_map", width = 9, height = 9)
+}
 
-top_sf <- zones_sf[order(-zones_sf$revenue), ][1:25, ]
-cent <- suppressWarnings(st_coordinates(st_centroid(top_sf)))
-top_sf$lng <- cent[, 1]; top_sf$lat <- cent[, 2]
-pal <- colorNumeric("YlOrRd", domain = top_sf$avg_total)
-m <- leaflet(top_sf) |>
-  addProviderTiles(providers$CartoDB.Positron) |>
-  addPolygons(data = zones_sf, weight = 0.4, color = "grey", fillOpacity = 0.05) |>
-  addCircleMarkers(~lng, ~lat, radius = ~sqrt(pickups) / 60, color = ~pal(avg_total), fillOpacity = 0.8, stroke = FALSE,
-                   label = ~sprintf("%s (%s): %s pickups, $%s M revenue, $%.2f avg", zone, borough, comma(pickups), round(revenue / 1e6, 1), avg_total)) |>
-  addLegend("bottomright", pal = pal, values = ~avg_total, title = "Avg total (USD)")
-saveWidget(m, file.path(normalizePath(OUT_DIR), "leaflet_top_revenue_zones.html"), selfcontained = TRUE)
+if (HAVE_MAPS) {
+# an interactive choropleth: zone polygons never overlap, unlike circle markers
+map_sf <- zones_sf[!is.na(zones_sf$revenue), ]
+pal <- colorNumeric("YlOrRd", domain = log10(map_sf$revenue))
+m <- leaflet(map_sf) |>
+  addTiles() |>                                   # plain OpenStreetMap tiles, no API key needed
+  setView(lng = -73.93, lat = 40.73, zoom = 11) |>
+  addPolygons(fillColor = ~pal(log10(revenue)), fillOpacity = 0.75, weight = 0.6, color = "white",
+              highlightOptions = highlightOptions(weight = 2.5, color = "#1F4E79", bringToFront = TRUE),
+              label = ~sprintf("%s (%s): %s pickups, $%s M revenue, $%.2f per trip",
+                               zone, borough, comma(pickups), round(revenue / 1e6, 2), avg_total)) |>
+  addLegend("bottomright", pal = pal, values = ~log10(revenue), title = "Revenue (USD)",
+            labFormat = labelFormat(transform = function(x) round(10^x)))
+saveWidget(m, file.path(normalizePath(OUT_DIR), "leaflet_revenue_by_zone.html"), selfcontained = TRUE)
 m
+}
 
-# *The busiest and highest-revenue zones are concentrated in Midtown/Lower Manhattan, while the two airports
-# (JFK, LaGuardia) stand out with the highest average amount per trip. Open
-# `outputs/leaflet_top_revenue_zones.html` for the interactive map.*
+# *Each taxi zone is shaded by the **total revenue collected from trips starting there** (log scale). Midtown,
+# the Upper East Side and the two airports are the dark, high-revenue areas; hover over any zone to see its
+# pickups, revenue and average amount per trip.*
+#
+# > **Note on the saved notebook:** an interactive leaflet widget embeds the whole map library (about 4 MB), which
+# > stops GitHub from rendering the notebook in the browser. The committed notebook therefore shows a static
+# > preview of this map. Run the cell yourself, or open
+# > `outputs/leaflet_revenue_by_zone.html`, for the fully interactive version.
 
 # ---
 # ## 9. Observations
