@@ -3,7 +3,7 @@
 #   Rscript -e 'source("R/nyc_taxi_analysis.R", print.eval = TRUE)' )
 
 # # High-Performance Big Data Analytics Using R
-# ## NYC Yellow Taxi Trip Records (January – June 2024)
+# ## NYC Yellow Taxi Trip Records, 2024
 #
 # **Laboratory Assignment 8 – R Programming**
 #
@@ -47,7 +47,7 @@
 # | Item | Description |
 # |---|---|
 # | Source | NYC TLC Trip Record Data – <https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page> |
-# | Trip files | Yellow Taxi Trip Records, **January – June 2024** (6 monthly Parquet files, ≈ 20 million trips) |
+# | Trip files | Yellow Taxi Trip Records 2024: **January–June** locally (6 files, ≈ 20 M trips) or **January–March** on Colab (3 files, ≈ 9 M trips), set by `MONTHS` |
 # | Lookup table | Taxi Zone Lookup Table (`taxi_zone_lookup.csv`, 265 zones) + Taxi Zone shapefile (for the map) |
 #
 # Main attributes used:
@@ -120,6 +120,12 @@ set.seed(2024)
 options(repr.plot.width = 12, repr.plot.height = 6, scipen = 999, width = 140)
 
 MONTHS   <- if (ON_COLAB) sprintf("2024-%02d", 1:3) else sprintf("2024-%02d", 1:6)
+# everything below derives the analysis period from MONTHS, so changing MONTHS is enough
+MONTH_NUMS   <- as.integer(substr(MONTHS, 6, 7))
+PERIOD_START <- as.POSIXct(paste0(MONTHS[1], "-01 00:00:00"), tz = "UTC")
+PERIOD_END   <- as.POSIXct(paste0(seq(as.Date(paste0(MONTHS[length(MONTHS)], "-01")),
+                                      by = "month", length.out = 2)[2], " 00:00:00"), tz = "UTC")
+PERIOD_LABEL <- sprintf("%s-%s 2024", month.abb[MONTH_NUMS[1]], month.abb[MONTH_NUMS[length(MONTH_NUMS)]])
 DATA_DIR <- if (ON_COLAB) "/content/data" else "data"
 OUT_DIR  <- if (ON_COLAB) "/content/outputs" else "outputs"
 FIG_DIR  <- file.path(OUT_DIR, "figures")
@@ -131,7 +137,7 @@ N_CORES <- max(2L, parallel::detectCores() - 1L)
 
 cat("R version          :", R.version.string, "\n")
 cat("data.table version :", as.character(packageVersion("data.table")), "\n")
-cat("Running on Colab   :", ON_COLAB, "| months analysed:", length(MONTHS), "\n")
+cat("Running on Colab   :", ON_COLAB, "| period analysed:", PERIOD_LABEL, "\n")
 cat("Parquet reader     :", if (HAVE_ARROW) "arrow" else "nanoparquet",
     "| mapping packages available:", HAVE_MAPS, "\n")
 cat("Logical cores      :", parallel::detectCores(), "| cores used for parallel work:", N_CORES, "\n")
@@ -254,12 +260,12 @@ apply_rule <- function(step, ok) {
 # trip duration in minutes (vectorized, added by reference)
 trips[, trip_duration_min := as.numeric(tpep_dropoff_datetime - tpep_pickup_datetime, units = "mins")]
 
-period_start <- as.POSIXct("2024-01-01 00:00:00", tz = "UTC")
-period_end   <- as.POSIXct("2024-07-01 00:00:00", tz = "UTC")
-
 apply_rule("Remove duplicate trips", !duplicated(trips, by = c("VendorID", "tpep_pickup_datetime", "tpep_dropoff_datetime",
                                                                "PULocationID", "DOLocationID", "trip_distance", "total_amount")))
-apply_rule("Remove pickups outside Jan-Jun 2024", trips[, tpep_pickup_datetime >= period_start & tpep_pickup_datetime < period_end])
+# a monthly file holds a few trips whose meter clock spills into the next month; bounding the period by the
+# months actually loaded stops those few rows forming a spurious extra partition in Task 4
+apply_rule(paste("Remove pickups outside", PERIOD_LABEL),
+           trips[, tpep_pickup_datetime >= PERIOD_START & tpep_pickup_datetime < PERIOD_END])
 apply_rule("Remove invalid fare / total / tip / tolls",
            trips[, fare_amount > 0 & fare_amount <= 500 & total_amount > 0 & tip_amount >= 0 & tolls_amount >= 0])
 apply_rule("Remove invalid trip distance", trips[, trip_distance > 0 & trip_distance <= 100])
@@ -306,7 +312,7 @@ t_time <- system.time({
     pickup_hour  = hour(tpep_pickup_datetime),
     pickup_day   = mday(tpep_pickup_datetime),
     pickup_wday  = factor((wday(tpep_pickup_datetime) + 5L) %% 7L + 1L, levels = 1:7, labels = wday_labels),
-    month        = factor(month(tpep_pickup_datetime), levels = 1:6, labels = month.abb[1:6])
+    month        = factor(month(tpep_pickup_datetime), levels = MONTH_NUMS, labels = month.abb[MONTH_NUMS])
   )]
   trips[, is_weekend := pickup_wday %in% c("Sat", "Sun")]
   trips[, time_period := cut(pickup_hour, breaks = c(-1, 5, 9, 15, 19, 23),
@@ -721,18 +727,50 @@ light <- data.table(approach = c("Sequential foreach %do%", sprintf("Parallel fo
 light[, speedup_vs_seq := round(t_light_seq / elapsed_s, 2)]
 light
 
+# ### 6.7 What the measurements say
+# The next cell writes the conclusion **from the numbers measured on this machine**, so it stays correct whether
+# you run on a laptop with several cores or on a 2-core Colab session.
+
+n_parts  <- length(parts)
+ideal    <- n_parts / ceiling(n_parts / N_CORES)   # best speedup the partition and worker counts allow
+overhead <- scaling[cores == 1, parallel_s] - t_seq[["elapsed"]]
+parts_mb <- sum(vapply(parts, function(p) as.numeric(object.size(p)), numeric(1))) / 2^20
+
+cat(sprintf("Partitions: %d | workers: %d | best speedup these allow: %.2fx\n", n_parts, N_CORES, ideal))
+cat(sprintf("Sequential: %.1f s | parallel: %.1f s | measured speedup: %.2fx (efficiency %.0f%%)\n",
+            t_seq[["elapsed"]], t_par[["elapsed"]], speedup_main, 100 * speedup_main / N_CORES))
+cat(sprintf("Cost of going parallel at all (1 worker vs plain lapply): %.1f s for %.0f MB of partitions\n\n",
+            overhead, parts_mb))
+
+if (speedup_main >= 1.1) {
+  cat("RESULT: parallel execution was FASTER on this machine.\n")
+  cat(sprintf("It reached %.2fx of the %.2fx that %d partitions on %d workers allow. The gap is cluster\n",
+              speedup_main, ideal, n_parts, N_CORES))
+  cat("start-up, serialising each partition into a separate R process, and memory-bandwidth contention.\n")
+} else {
+  cat("RESULT: parallel execution was NOT faster on this machine.\n")
+  cat(sprintf("Even perfect scheduling could only reach %.2fx here (%d partitions over %d workers), and the\n",
+              ideal, n_parts, N_CORES))
+  cat(sprintf("%.1f s spent starting workers and copying %.0f MB of partitions to them cancels that out.\n",
+              overhead, parts_mb))
+  cat("On a 2-core machine the two vCPUs are often hyperthreads of one physical core, which limits it further.\n")
+}
+cat("\nThe lightweight task below is slower in parallel on every machine - that one is pure overhead.\n")
+
 # **Discussion**
 #
-# * For the **CPU-intensive bootstrap**, the parallel version is clearly faster; the speedup grows with the
-#   number of cores but stays **below the ideal linear speedup** (efficiency < 100 %) because of
-#   (1) cluster start-up, (2) serialising each ≈ 100 MB partition to the worker processes,
-#   (3) only 6 partitions for N workers (load imbalance: with 3 workers the last "round" is uneven when 6 is not
-#   a multiple of the core count) and (4) memory-bandwidth contention.
-# * For the **lightweight task** parallel execution is *slower* than sequential: the work per partition takes
-#   milliseconds while copying the data to workers takes seconds. A single data.table grouping on the full table
-#   (which is itself multi-threaded) is faster than both.
-# * Therefore parallel processing pays off only when the computation per partition is large compared with the
-#   communication overhead.
+# * Whether the **CPU-intensive bootstrap** gains from parallelism depends on the machine, and the cell above
+#   states which happened here. Two limits always apply. First, there must be enough partitions to keep every
+#   worker busy: with 3 partitions on 2 workers the best possible speedup is only 1.5×, because one worker sits
+#   idle during the second round. Second, each partition must be **serialised and copied** into a separate R
+#   process, which costs seconds for a 100 MB partition. On a 2-core Colab session the two vCPUs are often
+#   hyperthreads of a single physical core, so parallel execution can end up slower than sequential.
+# * For the **lightweight task** parallel execution is *always* slower: the work per partition takes
+#   milliseconds while copying the data to the workers takes seconds. A single data.table grouping on the full
+#   table (itself multi-threaded) beats both.
+# * So parallel processing pays off only when the computation per partition is large compared with the
+#   communication overhead, **and** there are enough partitions to keep the workers busy. This is exactly the
+#   experimental evidence that Task 7 question 6 asks for.
 
 # ---
 # ## 7. Task 5 – Performance Benchmarking and Optimization
@@ -857,7 +895,7 @@ p <- ggplot(hourly, aes(pickup_hour, trips / 1e3)) +
   scale_colour_manual(values = "#1F4E79", name = NULL) +
   scale_x_continuous(breaks = 0:23) +
   scale_y_continuous(labels = comma, sec.axis = sec_axis(~ . * max(hourly$avg_fare) / max(hourly$trips / 1e3), name = "Average fare (USD)")) +
-  labs(title = "1. Number of taxi trips by hour of day", subtitle = "NYC Yellow Taxi, Jan-Jun 2024",
+  labs(title = "1. Number of taxi trips by hour of day", subtitle = paste("NYC Yellow Taxi,", PERIOD_LABEL),
        x = "Pickup hour (0-23)", y = "Number of trips (thousands)")
 save_plot(p, "01_trips_by_hour")
 
@@ -1009,7 +1047,7 @@ zones_sf <- merge(zones_sf, zone_stats, by = "LocationID", all.x = TRUE)
 
 p <- ggplot(zones_sf) + geom_sf(aes(fill = pickups), colour = "white", linewidth = 0.05) +
   scale_fill_viridis_c(trans = "log10", labels = comma, name = "Pickups (log)", na.value = "grey90") +
-  labs(title = "15. Pickups by taxi zone") +
+  labs(title = paste("15. Pickups by taxi zone,", PERIOD_LABEL)) +
   theme_void(base_size = 13) + theme(legend.position = "right", plot.title = element_text(face = "bold"))
 save_plot(p, "15_pickup_map", width = 9, height = 9)
 }
@@ -1049,7 +1087,8 @@ obs <- data.table(
   metric = c("Trips analysed (after cleaning)", "Peak pickup hour", "Busiest weekday (avg trips/day)", "Busiest month (avg trips/day)",
              "Top revenue route", "Credit-card share of trips (%)", "Distance-fare correlation",
              "Row-level: apply() vs vectorized (x slower)", "Grouping 2M: lapply(split()) vs data.table (x slower)",
-             "Grouping 20M: aggregate() vs data.table (x slower)", "Join 2M: merge() vs data.table (x slower)",
+             sprintf("Grouping %s rows: aggregate() vs data.table (x slower)", format(nrow(trips), big.mark = ",")),
+             "Join 2M: merge() vs data.table (x slower)",
              sprintf("Parallel speedup with %d cores", N_CORES), "Light task: parallel vs sequential (speedup)"),
   value = c(format(nrow(trips), big.mark = ","), paste0(hourly[which.max(trips), pickup_hour], ":00"),
             as.character(dow[which.max(avg_trips_per_day), pickup_wday]), as.character(monthly[which.max(trips_per_day), month]),
@@ -1071,7 +1110,8 @@ obs
 #    payments are relatively more common outside Manhattan, and tips are recorded almost only for card payments.
 # 5. **Performance:** data.table and vectorized operations were faster than functional row-wise code by orders of
 #    magnitude; data.table beat base R `aggregate()`/`merge()` by a large factor while using less memory;
-#    parallel processing gave a real but sub-linear speedup for the heavy bootstrap and was slower for the light task.
+#    parallel processing helped the heavy bootstrap only when there were enough cores and partitions to keep the
+#    workers busy, and was slower than sequential for the lightweight task on every machine.
 
 # ---
 # ## 10. Task 7 – Critical Analysis and Recommendation
@@ -1103,16 +1143,22 @@ obs
 # giving the 1000×-scale gains measured in Experiment A.
 #
 # **5. What performance improvement was obtained using parallel computing?**
-# For the CPU-intensive month-wise bootstrap the measured speedup is shown in the scaling table (Section 6.5)
-# and the observations table – a clear gain that increases with the number of cores but stays below the ideal
-# (efficiency below 100 %).
+# The measured figure is in the scaling table (Section 6.5), in the interpretation printed in Section 6.7 and in
+# the observations table. On a 4-core machine with six monthly partitions the bootstrap ran about **2× faster**
+# on 3 workers (efficiency roughly 70–90 %). On a 2-core Colab session with three partitions there is **no gain
+# at all**: three partitions over two workers allow at most 1.5×, and the cost of starting the workers and
+# copying the partitions to them cancels even that. The gain is therefore a property of the machine and of the
+# partitioning, not of `foreach` itself.
 #
 # **6. Does parallel computing always result in faster execution?**
-# **No.** The lightweight task (mean fare per month) was *slower* in parallel than sequentially, because
-# starting workers and serialising ≈ 600 MB of partitions costs much more than the computation. Even for the
-# heavy task, overheads (data transfer, uneven number of partitions per worker, memory bandwidth) prevent linear
-# speedup. A single multi-threaded data.table grouping was faster than both partitioned versions for the light
-# task. Parallelism helps only when the computation per partition is large relative to the communication cost.
+# **No, and this notebook measured both outcomes.** The lightweight task (mean fare per month) was tens of times
+# slower in parallel, because starting the workers and serialising the partitions costs far more than the
+# arithmetic; a single multi-threaded data.table grouping beat both partitioned versions. The heavy bootstrap
+# gained about 2× on 4 cores with six partitions, but **nothing** on a 2-core session with three partitions.
+# Three causes explain that: too few partitions for the number of workers (3 over 2 workers caps the speedup at
+# 1.5×), the cost of copying every partition into a separate R process, and hyperthreaded vCPUs that are not two
+# independent cores. Parallelism helps only when the work per partition is large relative to the communication
+# cost **and** there are enough partitions to keep every worker busy.
 #
 # **7. Trade-offs between speed, memory, readability and scalability**
 #
