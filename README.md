@@ -2,7 +2,7 @@
 
 **Laboratory Assignment 8 – R Programming** · Swaroop Naik
 
-A scalable R analytics workflow for about **20 million NYC Yellow Taxi trips (January–June 2024)**. It covers
+A scalable R analytics workflow for NYC Yellow Taxi trips. The committed run covers **9.2 million trips (January–March 2024)** on Google Colab; running locally analyses six months (~20 M trips). It covers
 data preparation with **data.table**, transportation analytics, a comparison of **functional vs vectorized vs
 data.table** programming, **sequential vs parallel** processing with `foreach` + `doParallel`, benchmarking with
 `microbenchmark`, and visualizations with **ggplot2**, **sf** and **leaflet**.
@@ -71,24 +71,30 @@ uses at least two worker cores because a Colab session has only two. It download
 4. Export the PDF for submission: **File → Save and Export Notebook As → PDF / Webpdf**, or run
    `jupyter nbconvert --to webpdf NYC_Taxi_BigData_Analytics.ipynb`.
 
-**Memory:** all six months need about 10–12 GB of RAM. On an 8 GB machine, set
-`MONTHS <- sprintf("2024-%02d", 1:3)` in the setup cell. A full run takes about 18 minutes on 4 cores.
-Benchmark times and parallel speedups depend on the machine, so your numbers will differ slightly.
+**Memory:** all six months need about 10–12 GB of RAM. On an 8 GB machine, or on Colab, set
+`MONTHS <- sprintf("2024-%02d", 1:3)` in the setup cell (Colab does this automatically). A full run takes
+about 18 minutes on 4 cores and about 25 minutes on Colab.
 
-## Key results (reference run, 4-core machine)
+**Benchmark times and parallel speedups depend on the machine, so your numbers will differ.** The notebook is
+written to handle that: section 6.7 derives its conclusion about parallel execution from the numbers actually
+measured, so the text always matches the result. In the committed Colab run parallel execution gave **no
+speedup** (3 partitions over 2 workers allow at most 1.5×, and worker start-up plus copying 421 MB cancels
+it); on a 4-core machine with six monthly partitions the same code reaches about 2×.
+
+## Key results (Google Colab, 2 vCPU, Jan–Mar 2024)
 
 | Metric | Result |
 |---|---|
-| Trips analysed | 19,650,216 clean of 20,332,093 raw records |
-| Peak demand | 18:00, busiest weekday Thursday, busiest month May |
+| Trips analysed | 9,201,683 clean of 9,554,778 raw records (Jan–Mar 2024) |
+| Peak demand | 18:00; busiest weekday Thursday, busiest month March |
 | Revenue | airport trips ≈ 10 % of trips but ≈ 27 % of revenue; top route JFK Airport → Outside of NYC |
-| Distance vs fare | correlation 0.936; standard rate ≈ 6 USD + 3.9 USD per mile |
-| Payments | credit card 76.2 %, cash ≈ 13.5 % |
-| Row-level: apply() vs vectorized | 1.6 s vs 0.5 ms (3382× slower) |
-| Grouping 20M rows: aggregate() vs data.table | 15.1 s vs 386.5 ms (39×) |
-| Join 2M rows: merge() vs data.table | 4.9 s vs 164.8 ms (30×) |
-| Bootstrap per month: sequential vs parallel (3 cores) | 54.8 s vs 25.9 s (2.11× speedup) |
-| Light task in parallel | 0.03× – slower than sequential because of data-transfer overhead |
+| Distance vs fare | correlation 0.942; fare per mile falls sharply as trips get longer |
+| Payments | credit card 78.14 %, cash ≈ 13 % |
+| Row-level: apply() vs vectorized | 2.1 s vs 0.5 ms (4461× slower) |
+| Grouping 9.2M rows: aggregate() vs data.table | 8.6 s vs 334.6 ms (26×) |
+| Join 2M rows: merge() vs data.table | 4.4 s vs 206.3 ms (21×, and 860 MB vs 153 MB peak) |
+| Bootstrap: sequential vs parallel (2 cores) | 32.3 s vs 32.4 s — **no speedup** |
+| Light task in parallel | 0.01× – about 100× slower than sequential, pure overhead |
 
 ## Recommendation
 

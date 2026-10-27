@@ -1,34 +1,34 @@
 comparison,rows,approach,median_ms,relative_to_best,peak_mem_MB
-A: row-level fare per mile,200000,vectorized,0.475,1,2.4
-A: row-level fare per mile,200000,data.table,1.663,3.5,2.6
-A: row-level fare per mile,200000,purrr::map2_dbl(),378.596,797,167.9
-A: row-level fare per mile,200000,for loop,502.326,1057.5,182.7
-A: row-level fare per mile,200000,lapply(),601.574,1266.5,185.2
-A: row-level fare per mile,200000,apply(),1295.296,2726.9,198.7
-B: grouped mean by borough x hour,2000000,data.table by,48.548,1,57.5
-B: grouped mean by borough x hour,2000000,tapply(),110.675,2.3,77.8
-B: grouped mean by borough x hour,2000000,lapply(split()),254.528,5.2,248.2
-B: grouped mean by borough x hour,2000000,purrr::map_dbl(split()),270.389,5.6,246.4
-B: grouped mean by borough x hour,2000000,aggregate(),939.815,19.4,601.2
-B: grouped mean by borough x hour,2000000,sapply() filter per group,13311.047,274.2,3864.4
-C: column means (4 columns),2000000,lapply(),25.987,1,1.1
-C: column means (4 columns),2000000,purrr::map_dbl(),26.498,1,0
-C: column means (4 columns),2000000,data.table .SD,27.89,1.1,1.2
-C: column means (4 columns),2000000,colMeans() vectorized,34.09,1.3,61.1
-C: column means (4 columns),2000000,"apply(, 2)",98.583,3.8,213.7
-D: filter long expensive trips,19650216,data.table DT[cond],196.351,1,
-D: filter long expensive trips,19650216,"base R df[cond, ]",512.029,2.6,
-D: filter long expensive trips,19650216,base R subset(),582.276,3,
-E: revenue by month x hour,19650216,data.table by,536.636,1,
-E: revenue by month x hour,19650216,base R tapply(),1161.942,2.2,
-E: revenue by month x hour,19650216,base R aggregate(),13524.009,25.2,
-F: sort by total amount,19650216,data.table DT[order()],1848.599,1,
-F: sort by total amount,19650216,data.table setorder(),3236.427,1.8,
-F: sort by total amount,19650216,base R order(),5972.093,3.2,
-G: join 2M trips with zones,2000000,base R match(),25.335,1,30.5
-G: join 2M trips with zones,2000000,data.table join,119.066,4.7,152.9
-G: join 2M trips with zones,2000000,data.table update join :=,134.913,5.3,76.7
-G: join 2M trips with zones,2000000,base R merge(),3652.523,144.2,675.2
-H: bootstrap per month (sequential vs parallel),19650216,Parallel foreach %dopar% (3 cores),20691,1,
-H: bootstrap per month (sequential vs parallel),19650216,Sequential lapply(),40659,2,
-H: bootstrap per month (sequential vs parallel),19650216,Sequential foreach %do%,41263,2,
+A: row-level fare per mile,200000,vectorized,0.470,1.0,1.6
+A: row-level fare per mile,200000,data.table,1.752,3.7,1.8
+A: row-level fare per mile,200000,purrr::map2_dbl(),521.147,1108.8,166.4
+A: row-level fare per mile,200000,for loop,652.414,1388.1,218.3
+A: row-level fare per mile,200000,lapply(),1203.730,2561.1,311.5
+A: row-level fare per mile,200000,apply(),2096.547,4460.7,331.9
+B: grouped mean by borough x hour,2000000,data.table by,74.692,1.0,56.3
+B: grouped mean by borough x hour,2000000,tapply(),157.649,2.1,77.7
+B: grouped mean by borough x hour,2000000,purrr::map_dbl(split()),418.084,5.6,246.4
+B: grouped mean by borough x hour,2000000,lapply(split()),419.609,5.6,246.4
+B: grouped mean by borough x hour,2000000,aggregate(),1299.164,17.4,601.3
+B: grouped mean by borough x hour,2000000,sapply() filter per group,15209.270,203.6,2161.8
+C: column means (4 columns),2000000,lapply(),21.888,1.0,0.1
+C: column means (4 columns),2000000,purrr::map_dbl(),21.946,1.0,0.1
+C: column means (4 columns),2000000,data.table .SD,23.850,1.1,1.3
+C: column means (4 columns),2000000,colMeans() vectorized,31.920,1.5,61.2
+C: column means (4 columns),2000000,"apply(, 2)",99.983,4.6,213.8
+D: filter long expensive trips,9201683,data.table DT[cond],147.481,1.0,
+D: filter long expensive trips,9201683,"base R df[cond, ]",253.795,1.7,
+D: filter long expensive trips,9201683,base R subset(),412.847,2.8,
+E: revenue by month x hour,9201683,data.table by,334.607,1.0,
+E: revenue by month x hour,9201683,base R tapply(),763.331,2.3,
+E: revenue by month x hour,9201683,base R aggregate(),8627.501,25.8,
+F: sort by total amount,9201683,data.table DT[order()],1854.989,1.0,
+F: sort by total amount,9201683,data.table setorder(),2038.095,1.1,
+F: sort by total amount,9201683,base R order(),3110.677,1.7,
+G: join 2M trips with zones,2000000,base R match(),44.620,1.0,30.5
+G: join 2M trips with zones,2000000,data.table join,206.318,4.6,152.8
+G: join 2M trips with zones,2000000,data.table update join :=,290.880,6.5,76.7
+G: join 2M trips with zones,2000000,base R merge(),4390.468,98.4,859.8
+H: bootstrap per month (sequential vs parallel),9201683,Sequential foreach %do%,31345.000,1.0,
+H: bootstrap per month (sequential vs parallel),9201683,Sequential lapply(),32281.000,1.0,
+H: bootstrap per month (sequential vs parallel),9201683,Parallel foreach %dopar% (2 cores),32421.000,1.0,
